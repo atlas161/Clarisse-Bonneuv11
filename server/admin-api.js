@@ -1373,15 +1373,16 @@ const translateText = async (text, source, target) => {
   );
 };
 
-const toManagedUserPayload = async (user) => {
-  const supabase = getSupabaseAdmin();
-  const verifiedFactors = await listVerifiedMfaFactors(supabase, user.id).catch(() => []);
+const toManagedUserPayload = async (user, options = {}) => {
+  const resolvedRole = getUserRole(user) || getDefaultClientRole();
+  const includeMfa = typeof options.includeMfa === 'boolean' ? options.includeMfa : resolvedRole === 'admin';
+  const verifiedFactors = includeMfa ? await listVerifiedMfaFactors(getSupabaseAdmin(), user.id).catch(() => []) : [];
 
   return {
     id: user.id,
     email: user.email || '',
     displayName: String(user.user_metadata?.display_name || '').trim(),
-    role: getUserRole(user) || getDefaultClientRole(),
+    role: resolvedRole,
     createdAt: user.created_at || null,
     lastSignInAt: user.last_sign_in_at || null,
     invitedAt: user.invited_at || null,
@@ -1437,6 +1438,7 @@ const createManagedUser = async (body) => {
   const email = normalizeEmail(body.email);
   const role = getAllowedManagedRole(body.role);
   const displayName = String(body.displayName || '').trim();
+  const password = String(body.password || '').trim();
   const redirectTo = String(body.redirectTo || getClientInviteRedirect()).trim();
   const metadata = displayName ? { display_name: displayName } : {};
 
@@ -1452,6 +1454,41 @@ const createManagedUser = async (body) => {
 
   if (!email || !email.includes('@')) {
     throw new HttpError(400, 'Une adresse email valide est obligatoire.', 'invalid_user_email');
+  }
+
+  if (password) {
+    if (password.length < 8) {
+      throw new HttpError(400, 'Le mot de passe doit contenir au moins 8 caracteres.', 'invalid_user_password');
+    }
+
+    const { data, error } = await supabase.auth.admin.createUser({
+      email,
+      password,
+      email_confirm: true,
+      user_metadata: metadata,
+      app_metadata: {
+        role,
+      },
+    });
+
+    if (error || !data.user) {
+      throw new HttpError(400, error?.message || 'Impossible de creer ce compte.', 'create_user_failed');
+    }
+
+    return {
+      mode: 'password',
+      user: await toManagedUserPayload({
+        ...data.user,
+        app_metadata: {
+          ...(data.user.app_metadata || {}),
+          role,
+        },
+        user_metadata: {
+          ...(data.user.user_metadata || {}),
+          ...metadata,
+        },
+      }),
+    };
   }
 
   const { data, error } = await supabase.auth.admin.inviteUserByEmail(email, {

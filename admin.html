@@ -618,6 +618,11 @@
                     <span>Nom affiché</span>
                     <input type="text" name="displayName" autocomplete="off" placeholder="Agence ou client" />
                   </label>
+
+                  <label class="contact-field contact-field--full">
+                    <span>Mot de passe (optionnel)</span>
+                    <input type="password" name="password" autocomplete="new-password" placeholder="Laissez vide pour envoyer une invitation" />
+                  </label>
                 </div>
 
                 <div class="contact-field contact-field--full admin-users-form__role">
@@ -633,7 +638,7 @@
                 </div>
 
                 <div class="admin-users-form__footer contact-field--full">
-                  <p class="admin-help admin-users-form__help">Le compte reçoit un email d'invitation pour créer son mot de passe. Une seule application 2FA peut ensuite être configurée sur le compte.</p>
+                  <p class="admin-help admin-users-form__help">Si vous laissez le mot de passe vide, le compte reçoit un email d'invitation. Si vous renseignez un mot de passe, le compte est créé immédiatement (sans email) et pourra configurer la 2FA lors de sa première connexion.</p>
                   <div class="admin-form__actions admin-users-form__actions">
                     <button class="button-outline admin-primary-button" type="submit">Créer le compte</button>
                   </div>

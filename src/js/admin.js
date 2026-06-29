@@ -5326,11 +5326,13 @@ const bindEvents = () => {
 
     try {
       const formData = new FormData(dom.userForm);
+      const password = String(formData.get('password') || '').trim();
       // #region debug-point D:user-form-submit
       void reportInviteDebug('D', 'src/js/admin.js:userForm:submit', 'Submitting managed user invite form', {
         email: normalizeEmail(formData.get('email')),
         role: String(formData.get('role') || '').trim(),
         redirectTo: `${window.location.origin}/admin.html`,
+        hasPassword: Boolean(password),
       });
       // #endregion
       const payload = await apiRequest(getAdminApiPath('users'), {
@@ -5339,6 +5341,7 @@ const bindEvents = () => {
           email: formData.get('email'),
           displayName: formData.get('displayName'),
           role: formData.get('role'),
+          password: password || undefined,
           redirectTo: `${window.location.origin}/admin.html`,
         },
       });
@@ -5362,7 +5365,12 @@ const bindEvents = () => {
       });
       // #endregion
 
-      setStatus("Le compte a été créé et l'email d'invitation a été envoyé.", 'success');
+      setStatus(
+        payload?.mode === 'password'
+          ? "Le compte a été créé. Partagez l'email et le mot de passe avec la personne (la 2FA lui sera demandée lors de sa première connexion)."
+          : "Le compte a été créé et l'email d'invitation a été envoyé.",
+        'success'
+      );
       await Promise.all([loadUsers(), loadLogs()]);
     } catch (error) {
       // #region debug-point E:user-form-error
