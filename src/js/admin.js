@@ -5346,6 +5346,8 @@ const bindEvents = () => {
           redirectTo: `${window.location.origin}/admin.html`,
         },
       });
+      const generatedPassword =
+        payload?.mode === 'generated_password' ? String(payload?.temporaryPassword || '').trim() : '';
 
       dom.userForm.reset();
       if (dom.userRoleInput instanceof HTMLInputElement) {
@@ -5369,14 +5371,6 @@ const bindEvents = () => {
       });
       // #endregion
 
-      if (payload?.mode === 'generated_password' && dom.userLinkWrap && dom.userLinkOutput instanceof HTMLInputElement) {
-        dom.userLinkWrap.hidden = false;
-        if (dom.userLinkLabel instanceof HTMLElement) {
-          dom.userLinkLabel.textContent = 'Mot de passe temporaire :';
-        }
-        dom.userLinkOutput.value = String(payload?.temporaryPassword || '').trim();
-      }
-
       setStatus(
         payload?.mode === 'invite'
           ? "Le compte a été créé et l'email d'invitation a été envoyé."
@@ -5386,6 +5380,17 @@ const bindEvents = () => {
         'success'
       );
       await Promise.all([loadUsers(), loadLogs()]);
+
+      if (generatedPassword && dom.userLinkWrap && dom.userLinkOutput instanceof HTMLInputElement) {
+        dom.userLinkWrap.hidden = false;
+        if (dom.userLinkLabel instanceof HTMLElement) {
+          dom.userLinkLabel.textContent = 'Mot de passe temporaire :';
+        }
+        dom.userLinkOutput.value = generatedPassword;
+        dom.userLinkOutput.focus();
+        dom.userLinkOutput.select();
+        dom.userLinkWrap.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      }
     } catch (error) {
       // #region debug-point E:user-form-error
       void reportInviteDebug('E', 'src/js/admin.js:userForm:error', 'Managed user invite request failed', {
@@ -5408,7 +5413,8 @@ const bindEvents = () => {
       if (!copied) {
         throw new Error('copy_failed');
       }
-      setStatus('Lien d’invitation copié.', 'success');
+      const label = dom.userLinkLabel instanceof HTMLElement ? dom.userLinkLabel.textContent || '' : '';
+      setStatus(label.toLowerCase().includes('mot de passe') ? 'Mot de passe copié.' : 'Copié.', 'success');
     } catch {
       setStatus("Impossible de copier le lien d'invitation automatiquement.", 'error');
     }
