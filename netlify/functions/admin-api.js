@@ -1,5 +1,4 @@
 import { EventEmitter } from 'node:events';
-import { handleAdminApi } from '../../server/admin-api.js';
 
 const normalizeHeaders = (headers = {}) =>
   Object.fromEntries(Object.entries(headers).map(([key, value]) => [String(key || '').toLowerCase(), value]));
@@ -75,7 +74,8 @@ const createMockResponse = () => {
 export const handler = async (event) => {
   const req = createMockRequest(event);
   const { response, done } = createMockResponse();
-  const timeoutMs = 9_000;
+  const timeoutMs = 9_500;
+  const { handleAdminApi } = await import('../../server/admin-api.js');
 
   const timeout = new Promise((resolve) => {
     setTimeout(() => {

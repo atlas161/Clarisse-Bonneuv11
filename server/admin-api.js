@@ -1,7 +1,5 @@
 import { createHmac, timingSafeEqual, randomBytes } from 'node:crypto';
-import { v2 as cloudinary } from 'cloudinary';
 import { createClient } from '@supabase/supabase-js';
-import { clearPortfolioPayloadCache } from './cloudinary-portfolio.js';
 import {
   createExternalYoutubeItem,
   deleteExternalMediaItem,
@@ -326,7 +324,9 @@ const getManualOrderSortValue = (resource) => {
   return order ?? Number.POSITIVE_INFINITY;
 };
 
-const configureCloudinary = () => {
+let cloudinaryConfigured = false;
+
+const configureCloudinary = async () => {
   const cloudName = process.env.CLOUDINARY_CLOUD_NAME;
   const apiKey = process.env.CLOUDINARY_API_KEY;
   const apiSecret = process.env.CLOUDINARY_API_SECRET;
@@ -335,14 +335,29 @@ const configureCloudinary = () => {
     throw new HttpError(500, 'La configuration Cloudinary est incomplète.', 'cloudinary_config_missing');
   }
 
-  cloudinary.config({
-    cloud_name: cloudName,
-    api_key: apiKey,
-    api_secret: apiSecret,
-    secure: true,
-  });
+  const { v2: cloudinary } = await import('cloudinary');
 
-  return { cloudName, apiKey, apiSecret };
+  if (!cloudinaryConfigured) {
+    cloudinary.config({
+      cloud_name: cloudName,
+      api_key: apiKey,
+      api_secret: apiSecret,
+      secure: true,
+    });
+    cloudinaryConfigured = true;
+  }
+
+  return { cloudinary, cloudName, apiKey, apiSecret };
+};
+
+const clearPortfolioPayloadCacheSafe = () => {
+  try {
+    return import('./cloudinary-portfolio.js').then((module) => {
+      module.clearPortfolioPayloadCache(getRootFolder());
+    });
+  } catch {
+    return Promise.resolve();
+  }
 };
 
 const getSupabaseAdmin = () => {
@@ -661,6 +676,7 @@ const fetchAllResources = async (prefix, resourceType) => {
   let nextCursor;
 
   try {
+    const { cloudinary } = await configureCloudinary();
     do {
       const response = await cloudinary.api.resources({
         type: 'upload',
@@ -704,7 +720,7 @@ const fetchAllResources = async (prefix, resourceType) => {
 };
 
 const getResourceDetails = async (publicId, resourceType = 'image') => {
-  configureCloudinary();
+  const { cloudinary } = await configureCloudinary();
 
   return cloudinary.api.resource(publicId, {
     resource_type: resourceType === 'video' ? 'video' : 'image',
@@ -770,6 +786,7 @@ const getImmediateChildFolders = (currentFolder, resources, externalItems) => {
 };
 
 const listCloudinarySubFolders = async (folderPath) => {
+  const { cloudinary } = await configureCloudinary();
   try {
     const response = await cloudinary.api.sub_folders(folderPath);
     // #region debug-point C:subfolders-success
@@ -796,6 +813,7 @@ const inferSubfoldersFromResources = async (folderPath) => {
   const normalizedFolder = normalizePath(folderPath);
   const prefix = `${normalizedFolder}/`;
   const discovered = new Set();
+  const { cloudinary } = await configureCloudinary();
 
   const collectFromResourceType = async (resourceType) => {
     try {
@@ -924,13 +942,12 @@ const reorderFolders = async (parentFolder, items) => {
   }
 
   await reorderTrackedSubfolders(parentPath, normalizedItems);
-  clearPortfolioPayloadCache(getRootFolder());
+  void clearPortfolioPayloadCacheSafe();
 
   return parentPath;
 };
 
 const getFolderNavigatorPayload = async (folderInput) => {
-  configureCloudinary();
   const currentFolder = await resolveCanonicalFolderPath(folderInput);
   const [cloudinarySubFolders, trackedSubFolders] = await Promise.all([
     listCloudinarySubFolders(currentFolder),
@@ -982,7 +999,7 @@ const getFolderPayload = async (folderInput) => {
     };
   }
 
-  const { cloudName } = configureCloudinary();
+  const { cloudName } = await configureCloudinary();
   const [imageResources, videoResources, externalItems] = await Promise.all([
     fetchAllResources(`${currentFolder}/`, 'image'),
     fetchAllResources(`${currentFolder}/`, 'video'),
@@ -1019,7 +1036,7 @@ const getFolderPayload = async (folderInput) => {
 };
 
 const createFolder = async (folderName, parentFolder) => {
-  configureCloudinary();
+  const { cloudinary } = await configureCloudinary();
   const normalizedFolderName = normalizePath(folderName).split('/').pop();
 
   if (!normalizedFolderName) {
@@ -1042,7 +1059,7 @@ const createFolder = async (folderName, parentFolder) => {
 };
 
 const renameFolder = async (folderPath, nextName) => {
-  configureCloudinary();
+  const { cloudinary } = await configureCloudinary();
   const currentPath = await resolveCanonicalFolderPath(folderPath);
   const rootFolder = getRootFolder();
 
@@ -1101,7 +1118,7 @@ const registerExistingFolder = async (folderName, parentFolder) => {
 };
 
 const deleteFolder = async (folderPath) => {
-  configureCloudinary();
+  const { cloudinary } = await configureCloudinary();
   const normalizedPath = normalizeWithinRoot(folderPath);
   const rootFolder = getRootFolder();
 
@@ -1139,7 +1156,7 @@ const deleteAsset = async (publicId, resourceType = 'image', assetSource = 'clou
     return;
   }
 
-  configureCloudinary();
+  const { cloudinary } = await configureCloudinary();
   const normalizedPublicId = normalizePath(publicId);
   const normalizedRoot = getRootFolder();
 
@@ -1165,7 +1182,7 @@ const updateAsset = async (publicId, resourceType = 'image', updates = {}, asset
     return;
   }
 
-  configureCloudinary();
+  const { cloudinary } = await configureCloudinary();
   const normalizedPublicId = normalizePath(publicId);
   const normalizedRoot = getRootFolder();
 
@@ -1254,7 +1271,7 @@ const reorderAssets = async (items) => {
       }))
   );
 
-  clearPortfolioPayloadCache(getRootFolder());
+  void clearPortfolioPayloadCacheSafe();
 };
 
 const createYoutubeVideo = async (body) => {
@@ -1283,7 +1300,7 @@ const createYoutubeVideo = async (body) => {
 };
 
 const signUpload = async (body) => {
-  const { apiKey, apiSecret, cloudName } = configureCloudinary();
+  const { apiKey, apiSecret, cloudName, cloudinary } = await configureCloudinary();
   const uploadPreset = process.env.CLOUDINARY_UPLOAD_PRESET;
 
   if (!uploadPreset) {
