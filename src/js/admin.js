@@ -345,6 +345,7 @@ const dom = {
   userRoleButtons: document.querySelectorAll('[data-admin-user-role-buttons] [data-value]'),
   userList: document.querySelector('[data-admin-user-list]'),
   userLinkWrap: document.querySelector('[data-admin-user-link-wrap]'),
+  userLinkLabel: document.querySelector('[data-admin-user-link-label]'),
   userLinkOutput: document.querySelector('[data-admin-user-link-output]'),
   copyUserLinkButton: document.querySelector('[data-admin-copy-user-link]'),
   statTotal: document.querySelector('[data-admin-stat-total]'),
@@ -5356,6 +5357,9 @@ const bindEvents = () => {
         dom.userLinkWrap.hidden = true;
         dom.userLinkOutput.value = '';
       }
+      if (dom.userLinkLabel instanceof HTMLElement) {
+        dom.userLinkLabel.textContent = 'Accès généré :';
+      }
 
       // #region debug-point E:user-form-response
       void reportInviteDebug('E', 'src/js/admin.js:userForm:response', 'Managed user invite response received', {
@@ -5365,10 +5369,20 @@ const bindEvents = () => {
       });
       // #endregion
 
+      if (payload?.mode === 'generated_password' && dom.userLinkWrap && dom.userLinkOutput instanceof HTMLInputElement) {
+        dom.userLinkWrap.hidden = false;
+        if (dom.userLinkLabel instanceof HTMLElement) {
+          dom.userLinkLabel.textContent = 'Mot de passe temporaire :';
+        }
+        dom.userLinkOutput.value = String(payload?.temporaryPassword || '').trim();
+      }
+
       setStatus(
-        payload?.mode === 'password'
-          ? "Le compte a été créé. Partagez l'email et le mot de passe avec la personne (la 2FA lui sera demandée lors de sa première connexion)."
-          : "Le compte a été créé et l'email d'invitation a été envoyé.",
+        payload?.mode === 'invite'
+          ? "Le compte a été créé et l'email d'invitation a été envoyé."
+          : payload?.mode === 'generated_password'
+            ? "Le compte a été créé. Copiez le mot de passe temporaire puis partagez-le avec la personne (la 2FA lui sera demandée lors de sa première connexion)."
+            : "Le compte a été créé. Partagez l'email et le mot de passe avec la personne (la 2FA lui sera demandée lors de sa première connexion).",
         'success'
       );
       await Promise.all([loadUsers(), loadLogs()]);

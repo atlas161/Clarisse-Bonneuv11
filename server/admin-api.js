@@ -1,4 +1,4 @@
-import { createHmac, timingSafeEqual } from 'node:crypto';
+import { createHmac, timingSafeEqual, randomBytes } from 'node:crypto';
 import { v2 as cloudinary } from 'cloudinary';
 import { createClient } from '@supabase/supabase-js';
 import { clearPortfolioPayloadCache } from './cloudinary-portfolio.js';
@@ -1439,6 +1439,7 @@ const createManagedUser = async (body) => {
   const role = getAllowedManagedRole(body.role);
   const displayName = String(body.displayName || '').trim();
   const password = String(body.password || '').trim();
+  const requestMode = String(body.mode || '').trim().toLowerCase();
   const redirectTo = String(body.redirectTo || getClientInviteRedirect()).trim();
   const metadata = displayName ? { display_name: displayName } : {};
 
@@ -1456,77 +1457,80 @@ const createManagedUser = async (body) => {
     throw new HttpError(400, 'Une adresse email valide est obligatoire.', 'invalid_user_email');
   }
 
-  if (password) {
-    if (password.length < 8) {
-      throw new HttpError(400, 'Le mot de passe doit contenir au moins 8 caracteres.', 'invalid_user_password');
+  if (requestMode === 'invite') {
+    const { data, error } = await supabase.auth.admin.inviteUserByEmail(email, {
+      data: metadata,
+      redirectTo,
+    });
+
+    // #region debug-point B:invite-generate-link-result
+    void reportInviteDebug('B', 'server/admin-api.js:createManagedUser:inviteUserByEmail', 'Supabase inviteUserByEmail response received', {
+      email,
+      hasError: Boolean(error),
+      errorMessage: error?.message || '',
+      userId: data?.user?.id || '',
+      userEmail: data?.user?.email || '',
+      invitedAt: data?.user?.invited_at || '',
+      confirmationSentAt: data?.user?.confirmation_sent_at || '',
+      redirectTo,
+    });
+    // #endregion
+
+    if (error || !data.user) {
+      throw new HttpError(400, error?.message || "Impossible d'envoyer l'invitation par email.", 'invite_email_failed');
     }
 
-    const { data, error } = await supabase.auth.admin.createUser({
-      email,
-      password,
-      email_confirm: true,
-      user_metadata: metadata,
+    await supabase.auth.admin.updateUserById(data.user.id, {
       app_metadata: {
+        ...(data.user.app_metadata || {}),
         role,
       },
     });
 
-    if (error || !data.user) {
-      throw new HttpError(400, error?.message || 'Impossible de creer ce compte.', 'create_user_failed');
-    }
-
     return {
-      mode: 'password',
+      mode: 'invite',
       user: await toManagedUserPayload({
         ...data.user,
         app_metadata: {
           ...(data.user.app_metadata || {}),
           role,
         },
-        user_metadata: {
-          ...(data.user.user_metadata || {}),
-          ...metadata,
-        },
       }),
     };
   }
 
-  const { data, error } = await supabase.auth.admin.inviteUserByEmail(email, {
-    data: metadata,
-    redirectTo,
-  });
+  const effectivePassword = password || randomBytes(18).toString('base64url');
 
-  // #region debug-point B:invite-generate-link-result
-  void reportInviteDebug('B', 'server/admin-api.js:createManagedUser:inviteUserByEmail', 'Supabase inviteUserByEmail response received', {
-    email,
-    hasError: Boolean(error),
-    errorMessage: error?.message || '',
-    userId: data?.user?.id || '',
-    userEmail: data?.user?.email || '',
-    invitedAt: data?.user?.invited_at || '',
-    confirmationSentAt: data?.user?.confirmation_sent_at || '',
-    redirectTo,
-  });
-  // #endregion
-
-  if (error || !data.user) {
-    throw new HttpError(400, error?.message || "Impossible d'envoyer l'invitation par email.", 'invite_email_failed');
+  if (effectivePassword.length < 8) {
+    throw new HttpError(400, 'Le mot de passe doit contenir au moins 8 caracteres.', 'invalid_user_password');
   }
 
-  await supabase.auth.admin.updateUserById(data.user.id, {
+  const { data, error } = await supabase.auth.admin.createUser({
+    email,
+    password: effectivePassword,
+    email_confirm: true,
+    user_metadata: metadata,
     app_metadata: {
-      ...(data.user.app_metadata || {}),
       role,
     },
   });
 
+  if (error || !data.user) {
+    throw new HttpError(400, error?.message || 'Impossible de creer ce compte.', 'create_user_failed');
+  }
+
   return {
-    mode: 'invite',
+    mode: password ? 'password' : 'generated_password',
+    temporaryPassword: password ? null : effectivePassword,
     user: await toManagedUserPayload({
       ...data.user,
       app_metadata: {
         ...(data.user.app_metadata || {}),
         role,
+      },
+      user_metadata: {
+        ...(data.user.user_metadata || {}),
+        ...metadata,
       },
     }),
   };

@@ -34,6 +34,7 @@ const createMockResponse = () => {
   let statusCode = 200;
   const headers = {};
   let body = '';
+  let ended = false;
   let resolveResponse;
 
   const done = new Promise((resolve) => {
@@ -42,6 +43,9 @@ const createMockResponse = () => {
 
   return {
     response: {
+      get ended() {
+        return ended;
+      },
       get statusCode() {
         return statusCode;
       },
@@ -52,6 +56,10 @@ const createMockResponse = () => {
         headers[name] = value;
       },
       end(value = '') {
+        if (ended) {
+          return;
+        }
+        ended = true;
         body = value;
         resolveResponse({
           statusCode,
@@ -67,8 +75,43 @@ const createMockResponse = () => {
 export const handler = async (event) => {
   const req = createMockRequest(event);
   const { response, done } = createMockResponse();
+  const timeoutMs = 9_000;
 
-  await handleAdminApi(req, response);
+  const timeout = new Promise((resolve) => {
+    setTimeout(() => {
+      if (!response.ended) {
+        response.statusCode = 504;
+        response.setHeader('Content-Type', 'application/json; charset=utf-8');
+        response.setHeader('Cache-Control', 'no-store');
+        response.end(JSON.stringify({ error: 'admin_api_timeout', message: "Le serveur a mis trop de temps a repondre." }));
+      }
+      resolve();
+    }, timeoutMs);
+  });
+
+  try {
+    await Promise.race([handleAdminApi(req, response), timeout]);
+  } catch (error) {
+    console.error('[netlify-admin-api]', error);
+    if (!response.ended) {
+      response.statusCode = 500;
+      response.setHeader('Content-Type', 'application/json; charset=utf-8');
+      response.setHeader('Cache-Control', 'no-store');
+      response.end(
+        JSON.stringify({
+          error: 'netlify_handler_error',
+          message: error instanceof Error ? error.message : 'Une erreur inattendue est survenue.',
+        })
+      );
+    }
+  }
+
+  if (!response.ended) {
+    response.statusCode = 500;
+    response.setHeader('Content-Type', 'application/json; charset=utf-8');
+    response.setHeader('Cache-Control', 'no-store');
+    response.end(JSON.stringify({ error: 'admin_api_no_response', message: 'Aucune reponse retournee.' }));
+  }
 
   return done;
 };
