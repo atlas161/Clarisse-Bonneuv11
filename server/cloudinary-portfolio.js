@@ -276,7 +276,13 @@ const createYoutubeEmbedUrl = (youtubeId, autoplay = false) => {
   return `https://www.youtube-nocookie.com/embed/${youtubeId}?${params.toString()}`;
 };
 
-const createPortfolioCacheKey = (root, locale) => `${normalizeRoot(root)}::${normalizeLocale(locale)}`;
+const normalizeCacheVersion = (value) => {
+  const normalized = String(value ?? '').trim();
+  return normalized ? normalized : '0';
+};
+
+const createPortfolioCacheKey = (root, locale, version) =>
+  `${normalizeRoot(root)}::${normalizeLocale(locale)}::${normalizeCacheVersion(version)}`;
 
 const clonePayload = (payload) => {
   if (typeof globalThis.structuredClone === 'function') {
@@ -286,8 +292,8 @@ const clonePayload = (payload) => {
   return JSON.parse(JSON.stringify(payload));
 };
 
-const readCachedPortfolioPayload = (root, locale) => {
-  const cached = portfolioPayloadCache.get(createPortfolioCacheKey(root, locale));
+const readCachedPortfolioPayload = (root, locale, version) => {
+  const cached = portfolioPayloadCache.get(createPortfolioCacheKey(root, locale, version));
 
   if (!cached) {
     return null;
@@ -299,8 +305,34 @@ const readCachedPortfolioPayload = (root, locale) => {
   };
 };
 
-const writeCachedPortfolioPayload = (root, locale, payload) => {
-  portfolioPayloadCache.set(createPortfolioCacheKey(root, locale), {
+const prunePortfolioCache = () => {
+  const now = Date.now();
+  for (const [key, entry] of portfolioPayloadCache.entries()) {
+    if (!entry || typeof entry !== 'object' || entry.expiresAt <= now) {
+      portfolioPayloadCache.delete(key);
+    }
+  }
+
+  const MAX_ENTRIES = 80;
+  if (portfolioPayloadCache.size <= MAX_ENTRIES) {
+    return;
+  }
+
+  const sorted = Array.from(portfolioPayloadCache.entries()).sort(([, left], [, right]) => {
+    const leftExpiry = Number(left?.expiresAt || 0);
+    const rightExpiry = Number(right?.expiresAt || 0);
+    return leftExpiry - rightExpiry;
+  });
+
+  const toRemove = Math.max(0, sorted.length - MAX_ENTRIES);
+  for (let index = 0; index < toRemove; index += 1) {
+    portfolioPayloadCache.delete(sorted[index][0]);
+  }
+};
+
+const writeCachedPortfolioPayload = (root, locale, version, payload) => {
+  prunePortfolioCache();
+  portfolioPayloadCache.set(createPortfolioCacheKey(root, locale, version), {
     payload: clonePayload(payload),
     expiresAt: Date.now() + PORTFOLIO_CACHE_TTL_MS,
   });
@@ -314,8 +346,11 @@ export const clearPortfolioPayloadCache = (rootInput) => {
     return;
   }
 
-  portfolioPayloadCache.delete(createPortfolioCacheKey(root, 'fr'));
-  portfolioPayloadCache.delete(createPortfolioCacheKey(root, 'en'));
+  for (const key of portfolioPayloadCache.keys()) {
+    if (key.startsWith(`${root}::fr::`) || key.startsWith(`${root}::en::`)) {
+      portfolioPayloadCache.delete(key);
+    }
+  }
 };
 
 const isRateLimitError = (error) => {
@@ -488,10 +523,11 @@ const fetchAllResources = async (prefix, resourceType) => {
   return resources;
 };
 
-export const getPortfolioPayload = async (rootInput, localeInput) => {
+export const getPortfolioPayload = async (rootInput, localeInput, versionInput) => {
   const root = normalizeRoot(rootInput);
   const locale = normalizeLocale(localeInput);
-  const cachedPayload = readCachedPortfolioPayload(root, locale);
+  const version = normalizeCacheVersion(versionInput);
+  const cachedPayload = readCachedPortfolioPayload(root, locale, version);
   const cloudName = process.env.CLOUDINARY_CLOUD_NAME;
   const apiKey = process.env.CLOUDINARY_API_KEY;
   const apiSecret = process.env.CLOUDINARY_API_SECRET;
@@ -550,7 +586,7 @@ export const getPortfolioPayload = async (rootInput, localeInput) => {
       items,
     };
 
-    writeCachedPortfolioPayload(root, locale, payload);
+    writeCachedPortfolioPayload(root, locale, version, payload);
     return clonePayload(payload);
   } catch (error) {
     if (cachedPayload?.payload && isRateLimitError(error)) {

@@ -9,7 +9,8 @@ export const handler = async (event) => {
   try {
     const locale = event.queryStringParameters?.locale || undefined;
     const root = event.queryStringParameters?.root || undefined;
-    const payload = await getPortfolioPayload(root, locale);
+    const version = event.queryStringParameters?.v || undefined;
+    const payload = await getPortfolioPayload(root, locale, version);
 
     return {
       statusCode: 200,

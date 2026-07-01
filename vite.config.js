@@ -111,7 +111,8 @@ const portfolioApiPlugin = () => ({
         const params = new URL(req.url || '/', 'http://localhost').searchParams;
         const root = params.get('root');
         const locale = params.get('locale') || undefined;
-        const payload = await getPortfolioPayload(root || undefined, locale);
+        const version = params.get('v') || undefined;
+        const payload = await getPortfolioPayload(root || undefined, locale, version);
         res.setHeader('Content-Type', 'application/json; charset=utf-8');
         res.setHeader('Cache-Control', PORTFOLIO_CACHE_CONTROL);
         res.end(JSON.stringify(payload));
@@ -148,7 +149,8 @@ const portfolioPreviewPlugin = () => ({
         const params = new URL(req.url || '/', 'http://localhost').searchParams;
         const root = params.get('root');
         const locale = params.get('locale') || undefined;
-        const payload = await getPortfolioPayload(root || undefined, locale);
+        const version = params.get('v') || undefined;
+        const payload = await getPortfolioPayload(root || undefined, locale, version);
         res.setHeader('Content-Type', 'application/json; charset=utf-8');
         res.setHeader('Cache-Control', PORTFOLIO_CACHE_CONTROL);
         res.end(JSON.stringify(payload));
