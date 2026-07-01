@@ -10,6 +10,14 @@ import {
   toExternalVideoAsset,
   updateExternalMediaItem,
 } from './external-media-store.js';
+import { deleteAssetOrder, getAssetOrder, listAssetOrdersByFolder, saveAssetOrderForFolder } from './admin-asset-order-store.js';
+import {
+  deleteAssetMetadata,
+  getAssetMetadata,
+  listAssetMetadataByFolder,
+  upsertAssetMetadata,
+  upsertAssetMetadataBulk,
+} from './admin-asset-metadata-store.js';
 import {
   listTrackedSubfolders,
   renameTrackedFolder,
@@ -553,7 +561,18 @@ const getAssetAuditSnapshot = async (publicId, resourceType = 'image', assetSour
   const context = resource.context?.custom || {};
   const fallbackName = normalizedPublicId.split('/').pop() || normalizedPublicId;
   const originalFilename = String(resource.original_filename || resource.display_name || '').trim();
-  const displayTitle = String(context.title || context.alt || originalFilename || fallbackName).trim() || fallbackName;
+  const normalizedRoot = getRootFolder();
+  const folderPath = normalizedPublicId.slice(0, normalizedPublicId.lastIndexOf('/')) || normalizedRoot;
+  const [metadata, orderOverride] = await Promise.all([
+    getAssetMetadata(folderPath, normalizedPublicId).catch(() => null),
+    getAssetOrder(folderPath, normalizedPublicId).catch(() => null),
+  ]);
+
+  const resolvedAlt = String(metadata?.alt ?? context.alt ?? '').trim();
+  const resolvedAltEn = String(metadata?.altEn ?? context.alt_en ?? '').trim();
+  const resolvedTags = Array.isArray(metadata?.tags) ? metadata.tags : Array.isArray(resource.tags) ? resource.tags : [];
+  const resolvedOrder = Number.isFinite(Number(orderOverride)) ? Number(orderOverride) : parseManualOrder(context.order);
+  const displayTitle = String(context.title || resolvedAlt || originalFilename || fallbackName).trim() || fallbackName;
 
   return {
     targetId: normalizedPublicId,
@@ -563,10 +582,10 @@ const getAssetAuditSnapshot = async (publicId, resourceType = 'image', assetSour
       resourceType: resource.resource_type,
       assetSource: 'cloudinary',
       title: displayTitle,
-      alt: String(context.alt || '').trim(),
-      altEn: String(context.alt_en || '').trim(),
-      tags: Array.isArray(resource.tags) ? resource.tags : [],
-      order: parseManualOrder(context.order),
+      alt: resolvedAlt,
+      altEn: resolvedAltEn,
+      tags: resolvedTags,
+      order: resolvedOrder,
     },
   };
 };
@@ -1000,15 +1019,57 @@ const getFolderPayload = async (folderInput) => {
   }
 
   const { cloudName } = await configureCloudinary();
-  const [imageResources, videoResources, externalItems] = await Promise.all([
+  const [imageResources, videoResources, externalItems, assetOrderMap, assetMetadataMap] = await Promise.all([
     fetchAllResources(`${currentFolder}/`, 'image'),
     fetchAllResources(`${currentFolder}/`, 'video'),
     listExternalMediaByFolder(currentFolder),
+    listAssetOrdersByFolder(currentFolder).catch(() => new Map()),
+    listAssetMetadataByFolder(currentFolder).catch(() => new Map()),
   ]);
 
   const assets = [...imageResources, ...videoResources]
     .map((resource) => toAssetPayload(resource, cloudName))
     .concat(externalItems.map((item) => toExternalVideoAsset(item)))
+    .map((asset) => {
+      if (!asset || (asset.assetSource === 'external' || asset.resourceType === 'external-video')) {
+        return asset;
+      }
+
+      const metadata = assetMetadataMap instanceof Map ? assetMetadataMap.get(normalizePath(asset.publicId)) : null;
+      if (metadata) {
+        const nextContext = {
+          ...(asset.context || {}),
+        };
+
+        if (String(metadata.alt || '').trim()) {
+          nextContext.alt = metadata.alt;
+        } else {
+          delete nextContext.alt;
+        }
+
+        if (String(metadata.altEn || '').trim()) {
+          nextContext.alt_en = metadata.altEn;
+        } else {
+          delete nextContext.alt_en;
+        }
+
+        asset = {
+          ...asset,
+          context: nextContext,
+          tags: Array.isArray(metadata.tags) ? metadata.tags : [],
+        };
+      }
+
+      const order = assetOrderMap instanceof Map ? assetOrderMap.get(normalizePath(asset.publicId)) : null;
+      if (Number.isFinite(order)) {
+        return {
+          ...asset,
+          order,
+        };
+      }
+
+      return asset;
+    })
     .sort(sortByOrderThenDate);
   const inferredSubFolders = getImmediateChildFolders(currentFolder, [...imageResources, ...videoResources], externalItems);
   const folders = mergeFolderEntries(
@@ -1169,6 +1230,12 @@ const deleteAsset = async (publicId, resourceType = 'image', assetSource = 'clou
     type: 'upload',
     invalidate: true,
   });
+
+  const folderPath = normalizedPublicId.slice(0, normalizedPublicId.lastIndexOf('/')) || normalizedRoot;
+  await Promise.all([
+    deleteAssetOrder(folderPath, normalizedPublicId).catch(() => undefined),
+    deleteAssetMetadata(folderPath, normalizedPublicId).catch(() => undefined),
+  ]);
 };
 
 const updateAsset = async (publicId, resourceType = 'image', updates = {}, assetSource = 'cloudinary') => {
@@ -1182,7 +1249,6 @@ const updateAsset = async (publicId, resourceType = 'image', updates = {}, asset
     return;
   }
 
-  const { cloudinary } = await configureCloudinary();
   const normalizedPublicId = normalizePath(publicId);
   const normalizedRoot = getRootFolder();
 
@@ -1190,57 +1256,11 @@ const updateAsset = async (publicId, resourceType = 'image', updates = {}, asset
     throw new HttpError(400, 'Le fichier cible est invalide.', 'invalid_public_id');
   }
 
-  const resource = await getResourceDetails(normalizedPublicId, resourceType);
-  const nextContext = {
-    ...(resource.context?.custom || {}),
-  };
-  const nextTags = Array.isArray(resource.tags) ? [...resource.tags] : [];
-
-  if (Object.prototype.hasOwnProperty.call(updates, 'order')) {
-    const parsedOrder = parseManualOrder(updates.order);
-
-    if (updates.order !== null && updates.order !== '' && parsedOrder === null) {
-      throw new HttpError(400, 'L ordre doit etre un nombre entier positif.', 'invalid_asset_order');
-    }
-
-    if (parsedOrder === null) {
-      delete nextContext.order;
-    } else {
-      nextContext.order = String(parsedOrder);
-    }
-  }
-
-  if (Object.prototype.hasOwnProperty.call(updates, 'alt')) {
-    const normalizedAlt = String(updates.alt || '').trim();
-
-    if (normalizedAlt) {
-      nextContext.alt = normalizedAlt;
-    } else {
-      delete nextContext.alt;
-    }
-  }
-
-  if (Object.prototype.hasOwnProperty.call(updates, 'altEn')) {
-    const normalizedAltEn = String(updates.altEn || '').trim();
-
-    if (normalizedAltEn) {
-      nextContext.alt_en = normalizedAltEn;
-    } else {
-      delete nextContext.alt_en;
-    }
-  }
-
-  if (Object.prototype.hasOwnProperty.call(updates, 'tags')) {
-    nextTags.splice(0, nextTags.length, ...(Array.isArray(updates.tags) ? updates.tags : []));
-  }
-
-  const context = toCloudinaryContextString(nextContext);
-
-  await cloudinary.uploader.explicit(normalizedPublicId, {
-    type: 'upload',
-    resource_type: resourceType === 'video' ? 'video' : 'image',
-    context,
-    tags: nextTags,
+  const folderPath = normalizedPublicId.slice(0, normalizedPublicId.lastIndexOf('/')) || normalizedRoot;
+  await upsertAssetMetadata(folderPath, normalizedPublicId, {
+    alt: updates.alt,
+    altEn: updates.altEn,
+    tags: Object.prototype.hasOwnProperty.call(updates, 'tags') ? updates.tags : [],
   });
 };
 
@@ -1258,18 +1278,41 @@ const reorderAssets = async (items) => {
     throw new HttpError(400, 'La liste a reordonner est vide.', 'missing_reorder_items');
   }
 
-  for (const item of normalizedItems) {
-    await updateAsset(item.publicId, item.resourceType, { order: item.order }, item.assetSource);
+  const folderGroups = new Map();
+  const externalItems = [];
+
+  normalizedItems.forEach((item) => {
+    if (item.assetSource === 'external' || item.resourceType === 'external-video') {
+      externalItems.push(item);
+      return;
+    }
+
+    const normalizedPublicId = normalizePath(item.publicId);
+    const normalizedRoot = getRootFolder();
+
+    if (!normalizedPublicId || !(normalizedPublicId === normalizedRoot || normalizedPublicId.startsWith(`${normalizedRoot}/`))) {
+      return;
+    }
+
+    const folderPath = normalizedPublicId.slice(0, normalizedPublicId.lastIndexOf('/')) || normalizedRoot;
+    if (!folderGroups.has(folderPath)) {
+      folderGroups.set(folderPath, []);
+    }
+    folderGroups.get(folderPath).push({ publicId: normalizedPublicId, sortOrder: item.order });
+  });
+
+  for (const [folderPath, orderedPublicIds] of folderGroups.entries()) {
+    await saveAssetOrderForFolder(folderPath, orderedPublicIds);
   }
 
-  await reorderExternalMediaItems(
-    normalizedItems
-      .filter((item) => item.assetSource === 'external' || item.resourceType === 'external-video')
-      .map((item) => ({
+  if (externalItems.length > 0) {
+    await reorderExternalMediaItems(
+      externalItems.map((item) => ({
         id: item.publicId,
         order: item.order,
       }))
-  );
+    );
+  }
 
   void clearPortfolioPayloadCacheSafe();
 };
@@ -1775,9 +1818,36 @@ const bulkUpdateAssets = async (items, updates) => {
     payload.tags = Array.isArray(updates.tags) ? updates.tags : [];
   }
 
+  const normalizedRoot = getRootFolder();
+  const cloudinaryRows = [];
+
   await Promise.all(
-    normalizedItems.map((item) => updateAsset(item.publicId, item.resourceType, payload, item.assetSource))
+    normalizedItems.map(async (item) => {
+      if (item.assetSource === 'external' || item.resourceType === 'external-video') {
+        await updateExternalMediaItem(item.publicId, payload);
+        return;
+      }
+
+      const normalizedPublicId = normalizePath(item.publicId);
+
+      if (!normalizedPublicId || !(normalizedPublicId === normalizedRoot || normalizedPublicId.startsWith(`${normalizedRoot}/`))) {
+        return;
+      }
+
+      const folderPath = normalizedPublicId.slice(0, normalizedPublicId.lastIndexOf('/')) || normalizedRoot;
+      cloudinaryRows.push({
+        folderPath,
+        publicId: normalizedPublicId,
+        alt: payload.alt,
+        altEn: payload.altEn,
+        tags: payload.tags,
+      });
+    })
   );
+
+  if (cloudinaryRows.length > 0) {
+    await upsertAssetMetadataBulk(cloudinaryRows);
+  }
 };
 
 const handleSession = async (req, res) => {
@@ -1981,7 +2051,7 @@ const handleAssets = async (req, res) => {
 
 const handleUploadSignature = async (req, res) => {
   await requireSession(req);
-  enforceRateLimit(req, 'admin:upload-signature', { limit: 60, windowMs: 60_000 });
+  enforceRateLimit(req, 'admin:upload-signature', { limit: 240, windowMs: 60_000 });
 
   if (req.method !== 'POST') {
     throw new HttpError(405, 'Methode non autorisee.', 'method_not_allowed');
@@ -2070,7 +2140,7 @@ const handleYoutubeVideos = async (req, res) => {
 
 const handleTranslate = async (req, res) => {
   await requireSession(req);
-  enforceRateLimit(req, 'admin:translate', { limit: 20, windowMs: 60_000 });
+  enforceRateLimit(req, 'admin:translate', { limit: 90, windowMs: 60_000 });
 
   if (req.method !== 'POST') {
     throw new HttpError(405, 'Methode non autorisee.', 'method_not_allowed');

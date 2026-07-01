@@ -495,6 +495,11 @@ const state = {
   bootstrapAdminEmail: '',
   reorderInFlight: false,
   folderReorderInFlight: false,
+  pendingAssetReorderItems: null,
+  pendingAssetReorderTimer: null,
+  pendingAssetReorderKey: '',
+  pendingAssetReorderQueued: false,
+  folderReloadTimer: null,
 };
 
 const ASSET_MENU_LONG_PRESS_MS = 360;
@@ -1510,6 +1515,17 @@ const setBusy = (button, isBusy, busyLabel) => {
 
   button.disabled = isBusy;
   button.innerHTML = isBusy ? busyLabel : button.dataset.defaultLabel;
+};
+
+const scheduleFolderReload = () => {
+  if (state.folderReloadTimer) {
+    window.clearTimeout(state.folderReloadTimer);
+  }
+
+  state.folderReloadTimer = window.setTimeout(() => {
+    state.folderReloadTimer = null;
+    void loadFolder(state.currentFolder);
+  }, 900);
 };
 
 const syncDeleteFolderButtonState = (folderPath = state.currentFolder, isPending = false) => {
@@ -3972,6 +3988,113 @@ const initSortable = () => {
     return;
   }
 
+const getAssetReorderKey = (assets) =>
+  Array.isArray(assets)
+    ? assets
+        .map((entry) => `${String(entry?.assetSource || 'cloudinary').trim()}|${String(entry?.resourceType || 'image').trim()}|${String(entry?.publicId || '').trim()}`)
+        .join('||')
+    : '';
+
+const sleep = (durationMs) => new Promise((resolve) => window.setTimeout(resolve, Math.max(0, Number(durationMs) || 0)));
+
+const isTransientApiError = (error) => {
+  const status = Number(error?.status || 0);
+  return status === 408 || status === 429 || status >= 500 || !(error instanceof Error);
+};
+
+const commitPendingAssetReorder = async () => {
+  const pending = state.pendingAssetReorderItems;
+  const pendingKey = state.pendingAssetReorderKey;
+
+  if (!Array.isArray(pending) || pending.length === 0 || !pendingKey) {
+    return;
+  }
+
+  if (state.reorderInFlight) {
+    state.pendingAssetReorderQueued = true;
+    return;
+  }
+
+  state.reorderInFlight = true;
+  state.pendingAssetReorderQueued = false;
+  syncSortableState();
+
+  try {
+    const retryDelays = [650, 1450, 3200];
+    for (let attempt = 0; attempt <= retryDelays.length; attempt += 1) {
+      try {
+        await apiRequest(getAdminApiPath('assets/reorder'), {
+          method: 'POST',
+          body: {
+            folder: state.currentFolder,
+            items: pending.map((entry) => ({
+              publicId: entry.publicId,
+              resourceType: entry.resourceType,
+              assetSource: entry.assetSource || 'cloudinary',
+            })),
+          },
+        });
+
+        bumpPortfolioCacheVersion();
+        setStatus('Le nouvel ordre a été enregistré.', 'success');
+        return;
+      } catch (error) {
+        const hasNewerPending = state.pendingAssetReorderKey && state.pendingAssetReorderKey !== pendingKey;
+
+        if (hasNewerPending) {
+          setStatus('Nouvel ordre détecté, enregistrement mis à jour...', 'info');
+          return;
+        }
+
+        if (attempt < retryDelays.length && isTransientApiError(error)) {
+          setStatus("Le serveur est occupé, nouvelle tentative d'enregistrement...", 'info');
+          await sleep(retryDelays[attempt]);
+          continue;
+        }
+
+        throw error;
+      }
+    }
+  } catch (error) {
+    setStatus(error instanceof Error ? error.message : 'Le réordonnancement des médias a échoué.', 'error');
+    scheduleFolderReload();
+  } finally {
+    const sentKey = pendingKey;
+    state.reorderInFlight = false;
+    syncSortableState();
+
+    const shouldFlushNewer =
+      (state.pendingAssetReorderQueued && state.pendingAssetReorderKey && state.pendingAssetReorderKey !== sentKey) ||
+      (state.pendingAssetReorderKey && state.pendingAssetReorderKey !== sentKey);
+
+    state.pendingAssetReorderQueued = false;
+
+    if (shouldFlushNewer) {
+      void commitPendingAssetReorder();
+    }
+  }
+};
+
+const scheduleAssetReorderCommit = (assets) => {
+  const key = getAssetReorderKey(assets);
+
+  if (!key) {
+    return;
+  }
+
+  state.pendingAssetReorderItems = assets;
+  state.pendingAssetReorderKey = key;
+
+  if (state.pendingAssetReorderTimer) {
+    window.clearTimeout(state.pendingAssetReorderTimer);
+  }
+
+  state.pendingAssetReorderTimer = window.setTimeout(() => {
+    state.pendingAssetReorderTimer = null;
+    void commitPendingAssetReorder();
+  }, 650);
+};
+
   state.sortable = new Sortable(dom.assetGrid, {
     animation: 220,
     easing: 'cubic-bezier(0.22, 1, 0.36, 1)',
@@ -4020,36 +4143,7 @@ const initSortable = () => {
       state.assets = reorderedAssets;
       renderAssets();
       setStatus('Enregistrement du nouvel ordre en cours...', 'info');
-
-      if (state.reorderInFlight) {
-        await loadFolder(state.currentFolder);
-        return;
-      }
-
-      state.reorderInFlight = true;
-      syncSortableState();
-
-      try {
-        await apiRequest(getAdminApiPath('assets/reorder'), {
-          method: 'POST',
-          body: {
-            items: reorderedAssets.map((entry) => ({
-              publicId: entry.publicId,
-              resourceType: entry.resourceType,
-              assetSource: entry.assetSource || 'cloudinary',
-            })),
-          },
-        });
-        bumpPortfolioCacheVersion();
-        setStatus('Le nouvel ordre a été enregistré et mis à jour dans la galerie.', 'success');
-        await loadFolder(state.currentFolder);
-      } catch (error) {
-        setStatus(error instanceof Error ? error.message : 'Le réordonnancement des médias a échoué.', 'error');
-        await loadFolder(state.currentFolder);
-      } finally {
-        state.reorderInFlight = false;
-        syncSortableState();
-      }
+      scheduleAssetReorderCommit(reorderedAssets);
     },
   });
 };
@@ -4344,7 +4438,7 @@ const createUploadWidget = (folder, tags, contextString, mediaKind) => {
 
       if (result?.event === 'success') {
         setStatus('Import terminé. Mise à jour de la bibliothèque en cours...', 'success');
-        void loadFolder(state.currentFolder);
+        scheduleFolderReload();
       }
     }
   );
@@ -4485,23 +4579,50 @@ const savePreviewChanges = async () => {
 
   try {
     const formData = new FormData(dom.previewForm);
+    const nextAlt = String(formData.get('alt') || '').trim();
+    const nextAltEn = String(formData.get('altEn') || '').trim();
+    const nextTags = parseTags(formData.get('tags'));
     await apiRequest(getAdminApiPath('assets'), {
       method: 'PATCH',
       body: {
         publicId: asset.publicId,
         resourceType: asset.resourceType,
         assetSource: asset.assetSource,
-        alt: formData.get('alt'),
-        altEn: formData.get('altEn'),
-        tags: parseTags(formData.get('tags')),
+        alt: nextAlt,
+        altEn: nextAltEn,
+        tags: nextTags,
       },
     });
     setStatus('Les informations du média ont été mises à jour.', 'success');
-    await loadFolder(state.currentFolder);
-    const refreshedAsset = state.assets.find((entry) => getAssetKey(entry) === state.previewAssetKey);
-    if (refreshedAsset) {
-      openPreview(refreshedAsset);
+    const assetIndex = state.assets.findIndex((entry) => getAssetKey(entry) === state.previewAssetKey);
+    if (assetIndex >= 0) {
+      const current = state.assets[assetIndex];
+      const nextContext = {
+        ...(current.context || {}),
+      };
+      if (nextAlt) {
+        nextContext.alt = nextAlt;
+      } else {
+        delete nextContext.alt;
+      }
+      if (nextAltEn) {
+        nextContext.alt_en = nextAltEn;
+      } else {
+        delete nextContext.alt_en;
+      }
+
+      const updatedAsset = {
+        ...current,
+        context: nextContext,
+        tags: nextTags,
+      };
+
+      state.assets[assetIndex] = updatedAsset;
+      renderAssets();
+      openPreview(updatedAsset);
     }
+
+    scheduleFolderReload();
   } catch (error) {
     setStatus(error instanceof Error ? error.message : 'La mise à jour du média a échoué.', 'error');
   } finally {
@@ -5853,6 +5974,9 @@ const bindEvents = () => {
 
     try {
       const formData = new FormData(dom.bulkForm);
+      const nextAlt = String(formData.get('alt') || '').trim();
+      const nextAltEn = String(formData.get('altEn') || '').trim();
+      const nextTags = parseTags(formData.get('tags'));
       await apiRequest(getAdminApiPath('assets/bulk'), {
         method: 'POST',
         body: {
@@ -5861,14 +5985,44 @@ const bindEvents = () => {
             resourceType: asset.resourceType,
             assetSource: asset.assetSource,
           })),
-          alt: formData.get('alt'),
-          altEn: formData.get('altEn'),
-          tags: parseTags(formData.get('tags')),
+          alt: nextAlt,
+          altEn: nextAltEn,
+          tags: nextTags,
         },
       });
       setStatus('La mise à jour groupée a été appliquée.', 'success');
       dom.bulkForm.reset();
-      await loadFolder(state.currentFolder);
+      selectedItems.forEach((selected) => {
+        const index = state.assets.findIndex((entry) => getAssetKey(entry) === getAssetKey(selected));
+        if (index < 0) {
+          return;
+        }
+
+        const current = state.assets[index];
+        const nextContext = {
+          ...(current.context || {}),
+        };
+        if (nextAlt) {
+          nextContext.alt = nextAlt;
+        } else {
+          delete nextContext.alt;
+        }
+        if (nextAltEn) {
+          nextContext.alt_en = nextAltEn;
+        } else {
+          delete nextContext.alt_en;
+        }
+
+        state.assets[index] = {
+          ...current,
+          context: nextContext,
+          tags: nextTags,
+        };
+      });
+
+      state.selectedAssetKeys.clear();
+      renderAssets();
+      scheduleFolderReload();
     } catch (error) {
       setStatus(error instanceof Error ? error.message : 'La mise à jour groupée a échoué.', 'error');
     } finally {

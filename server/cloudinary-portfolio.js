@@ -1,6 +1,8 @@
 import { v2 as cloudinary } from 'cloudinary';
 import { listExternalMediaByRoot } from './external-media-store.js';
 import { listTrackedSubfolders } from './admin-folder-store.js';
+import { listAssetOrdersByRoot } from './admin-asset-order-store.js';
+import { listAssetMetadataByRoot } from './admin-asset-metadata-store.js';
 
 const getFallbackRoot = () => process.env.PORTFOLIO_CLOUDINARY_ROOT || 'samples/clarisse_bonneu';
 const PORTFOLIO_CACHE_TTL_MS = 15 * 60 * 1000;
@@ -323,7 +325,7 @@ const isRateLimitError = (error) => {
   return httpCode === 420 || /rate limit/i.test(message);
 };
 
-const mapResourceToItem = (resource, root, cloudName, locale = 'fr') => {
+const mapResourceToItem = (resource, root, cloudName, locale = 'fr', orderOverrides = null, metadataOverrides = null) => {
   const relativePath = resource.public_id.startsWith(`${root}/`)
     ? resource.public_id.slice(root.length + 1)
     : resource.public_id;
@@ -331,12 +333,30 @@ const mapResourceToItem = (resource, root, cloudName, locale = 'fr') => {
   const category = slugify(folder || 'autres');
   const normalizedLocale = normalizeLocale(locale);
   const categoryLabel = toLabel(category, normalizedLocale);
-  const altFromContext =
-    normalizedLocale === 'en'
+  const normalizedPublicId = String(resource.public_id || '').trim();
+  const overrideOrder =
+    orderOverrides instanceof Map && normalizedPublicId ? orderOverrides.get(normalizedPublicId) : null;
+  const altFromContext = (() => {
+    const override = metadataOverrides instanceof Map && normalizedPublicId ? metadataOverrides.get(normalizedPublicId) : null;
+    if (override && normalizedLocale === 'en' && String(override.altEn || '').trim()) {
+      return override.altEn;
+    }
+    if (override && normalizedLocale !== 'en' && String(override.alt || '').trim()) {
+      return override.alt;
+    }
+
+    return normalizedLocale === 'en'
       ? resource.context?.custom?.alt_en || resource.context?.custom?.altEn
       : resource.context?.custom?.alt;
+  })();
   const isVideoResource = resource.resource_type === 'video';
-  const tags = Array.isArray(resource.tags) ? resource.tags.map((tag) => String(tag).toLowerCase()) : [];
+  const tags = (() => {
+    const override = metadataOverrides instanceof Map && normalizedPublicId ? metadataOverrides.get(normalizedPublicId) : null;
+    if (override && Array.isArray(override.tags) && override.tags.length > 0) {
+      return override.tags.map((tag) => String(tag).toLowerCase());
+    }
+    return Array.isArray(resource.tags) ? resource.tags.map((tag) => String(tag).toLowerCase()) : [];
+  })();
   const mediaType = isVideoResource ? 'video' : tags.includes('other') || tags.includes('autre') || tags.includes('autres') ? 'other' : 'photo';
 
   if (isVideoResource) {
@@ -345,7 +365,7 @@ const mapResourceToItem = (resource, root, cloudName, locale = 'fr') => {
       category,
       categoryLabel,
       mediaType,
-      order: getResourceOrder(resource),
+      order: Number.isFinite(Number(overrideOrder)) ? Number(overrideOrder) : getResourceOrder(resource),
       alt: altFromContext || `${interfaceCopy[normalizedLocale].defaultAltPrefix}${categoryLabel}`,
       width: resource.width || 900,
       height: resource.height || 1125,
@@ -363,7 +383,7 @@ const mapResourceToItem = (resource, root, cloudName, locale = 'fr') => {
     category,
     categoryLabel,
     mediaType,
-    order: getResourceOrder(resource),
+    order: Number.isFinite(Number(overrideOrder)) ? Number(overrideOrder) : getResourceOrder(resource),
     alt: altFromContext || `${interfaceCopy[normalizedLocale].defaultAltPrefix}${categoryLabel}`,
     width: resource.width || 900,
     height: resource.height || 1125,
@@ -492,17 +512,19 @@ export const getPortfolioPayload = async (rootInput, localeInput) => {
   });
 
   try {
-    const [imageResources, videoResources, categoryOrderMap] = await Promise.all([
+    const [imageResources, videoResources, categoryOrderMap, assetOrderMap, assetMetadataMap] = await Promise.all([
       fetchAllResources(`${root}/`, 'image'),
       fetchAllResources(`${root}/`, 'video'),
       getCategoryOrderMap(root),
+      listAssetOrdersByRoot(root).catch(() => new Map()),
+      listAssetMetadataByRoot(root).catch(() => new Map()),
     ]);
     const resources = [...imageResources, ...videoResources];
     const externalItems = await listExternalMediaByRoot(root);
     const items = sortItemsByCategoryOrder(
       resources
         .filter((resource) => resource.public_id !== root)
-        .map((resource) => mapResourceToItem(resource, root, cloudName, locale))
+        .map((resource) => mapResourceToItem(resource, root, cloudName, locale, assetOrderMap, assetMetadataMap))
         .filter((item) => item.category)
         .concat(externalItems.map((item) => mapExternalVideoToItem(item, root, locale))),
       categoryOrderMap
