@@ -13,6 +13,7 @@ import {
 import {
   deleteAssetOrder,
   getAssetOrder,
+  listAssetOrderEntriesByFolder,
   listAssetOrdersByFolder,
   renameAssetOrderFolderPrefix,
   saveAssetOrderForFolder,
@@ -897,17 +898,7 @@ const resolveCanonicalFolderPath = async (folderInput) => {
   let currentFolder = root;
 
   for (const segment of segments) {
-    const [cloudinarySubFolders, trackedSubFolders] = await Promise.all([
-      listCloudinarySubFolders(currentFolder),
-      listTrackedSubfolders(currentFolder),
-    ]);
-    const cloudinaryMatch = findFolderMatchBySegment(cloudinarySubFolders, segment);
-
-    if (cloudinaryMatch?.path) {
-      currentFolder = normalizePath(cloudinaryMatch.path);
-      continue;
-    }
-
+    const trackedSubFolders = await listTrackedSubfolders(currentFolder);
     const trackedMatch = findFolderMatchBySegment(trackedSubFolders, segment);
 
     if (typeof trackedMatch === 'string') {
@@ -975,28 +966,15 @@ const reorderFolders = async (parentFolder, items) => {
 
 const getFolderNavigatorPayload = async (folderInput) => {
   const currentFolder = await resolveCanonicalFolderPath(folderInput);
-  const [cloudinarySubFolders, trackedSubFolders] = await Promise.all([
-    listCloudinarySubFolders(currentFolder),
-    listTrackedSubfolders(currentFolder),
-  ]);
-  const inferredCloudinarySubFolders =
-    cloudinarySubFolders.length === 0 ? await inferSubfoldersFromResources(currentFolder) : [];
-  const cloudinaryFolderPaths = [
-    ...cloudinarySubFolders.map((folder) => folder.path),
-    ...inferredCloudinarySubFolders,
-  ];
-
-  await persistTrackedFolders(cloudinaryFolderPaths);
+  const trackedSubFolders = await listTrackedSubfolders(currentFolder);
 
   // #region debug-point B:navigator-payload
   void reportFolderDebug('B', 'server/admin-api.js:getFolderNavigatorPayload', 'Navigator payload assembled', {
     folderInput: folderInput || null,
     root: getRootFolder(),
     currentFolder,
-    cloudinaryCount: cloudinaryFolderPaths.length,
     trackedCount: trackedSubFolders.length,
-    mergedCount: mergeFolderEntries([...cloudinaryFolderPaths, ...trackedSubFolders], trackedSubFolders).length,
-    cloudinarySample: cloudinaryFolderPaths.slice(0, 5),
+    mergedCount: mergeFolderEntries(trackedSubFolders, trackedSubFolders).length,
     trackedSample: trackedSubFolders.slice(0, 5),
   });
   // #endregion
@@ -1008,7 +986,7 @@ const getFolderNavigatorPayload = async (folderInput) => {
       currentFolder === getRootFolder()
         ? null
         : currentFolder.slice(0, currentFolder.lastIndexOf('/')) || getRootFolder(),
-    folders: mergeFolderEntries([...cloudinaryFolderPaths, ...trackedSubFolders], trackedSubFolders),
+    folders: mergeFolderEntries(trackedSubFolders, trackedSubFolders),
   };
 };
 
@@ -1026,61 +1004,135 @@ const getFolderPayload = async (folderInput) => {
   }
 
   const { cloudName } = await configureCloudinary();
-  const [imageResources, videoResources, externalItems, assetOrderMap, assetMetadataMap] = await Promise.all([
-    fetchAllResources(`${currentFolder}/`, 'image'),
-    fetchAllResources(`${currentFolder}/`, 'video'),
+  const [externalItems, assetMetadataMap, orderedEntries] = await Promise.all([
     listExternalMediaByFolder(currentFolder),
-    listAssetOrdersByFolder(currentFolder).catch(() => new Map()),
     listAssetMetadataByFolder(currentFolder).catch(() => new Map()),
+    listAssetOrderEntriesByFolder(currentFolder).catch(() => []),
   ]);
 
-  const assets = [...imageResources, ...videoResources]
-    .map((resource) => toAssetPayload(resource, cloudName))
-    .concat(externalItems.map((item) => toExternalVideoAsset(item)))
-    .map((asset) => {
-      if (!asset || (asset.assetSource === 'external' || asset.resourceType === 'external-video')) {
-        return asset;
-      }
-
-      const metadata = assetMetadataMap instanceof Map ? assetMetadataMap.get(normalizePath(asset.publicId)) : null;
-      if (metadata) {
-        const nextContext = {
-          ...(asset.context || {}),
-        };
-
-        if (String(metadata.alt || '').trim()) {
-          nextContext.alt = metadata.alt;
-        } else {
-          delete nextContext.alt;
-        }
-
-        if (String(metadata.altEn || '').trim()) {
-          nextContext.alt_en = metadata.altEn;
-        } else {
-          delete nextContext.alt_en;
-        }
-
-        asset = {
-          ...asset,
-          context: nextContext,
-          tags: Array.isArray(metadata.tags) ? metadata.tags : [],
-        };
-      }
-
-      const order = assetOrderMap instanceof Map ? assetOrderMap.get(normalizePath(asset.publicId)) : null;
-      if (Number.isFinite(order)) {
-        return {
-          ...asset,
-          order,
-        };
-      }
-
+  const applyOverrides = (asset) => {
+    if (!asset || asset.assetSource === 'external' || asset.resourceType === 'external-video') {
       return asset;
-    })
+    }
+
+    const metadata = assetMetadataMap instanceof Map ? assetMetadataMap.get(normalizePath(asset.publicId)) : null;
+    if (metadata) {
+      const nextContext = {
+        ...(asset.context || {}),
+      };
+
+      if (String(metadata.alt || '').trim()) {
+        nextContext.alt = metadata.alt;
+      } else {
+        delete nextContext.alt;
+      }
+
+      if (String(metadata.altEn || '').trim()) {
+        nextContext.alt_en = metadata.altEn;
+      } else {
+        delete nextContext.alt_en;
+      }
+
+      asset = {
+        ...asset,
+        context: nextContext,
+        tags: Array.isArray(metadata.tags) ? metadata.tags : [],
+      };
+    }
+
+    return asset;
+  };
+
+  const resolveCloudinaryAssetsForFolder = async () => {
+    const orderedPublicIds = orderedEntries.map((entry) => entry.publicId).filter(Boolean);
+
+    if (orderedPublicIds.length === 0) {
+      const [imageResources, videoResources] = await Promise.all([
+        fetchAllResources(`${currentFolder}/`, 'image'),
+        fetchAllResources(`${currentFolder}/`, 'video'),
+      ]);
+      const assetsFromPrefix = [...imageResources, ...videoResources]
+        .map((resource) => toAssetPayload(resource, cloudName))
+        .map(applyOverrides)
+        .sort(sortByOrderThenDate);
+      const publicIdsToSeed = assetsFromPrefix
+        .filter((asset) => asset?.assetSource === 'cloudinary' && asset.publicId)
+        .map((asset) => normalizePath(asset.publicId))
+        .filter(Boolean);
+      if (publicIdsToSeed.length > 0) {
+        await saveAssetOrderForFolder(currentFolder, publicIdsToSeed);
+      }
+      return { assets: assetsFromPrefix, resources: [...imageResources, ...videoResources] };
+    }
+
+    const { cloudinary } = await configureCloudinary();
+    const chunk = (array, size) => {
+      const chunks = [];
+      for (let i = 0; i < array.length; i += size) {
+        chunks.push(array.slice(i, i + size));
+      }
+      return chunks;
+    };
+
+    const fetchByIds = async (publicIds, resourceType) => {
+      const batches = chunk(publicIds, 100);
+      const resources = [];
+      for (const batch of batches) {
+        const response = await cloudinary.api.resources_by_ids(batch, {
+          resource_type: resourceType,
+          type: 'upload',
+          context: true,
+          tags: true,
+          max_results: batch.length,
+        });
+        if (Array.isArray(response?.resources)) {
+          resources.push(...response.resources);
+        }
+      }
+      return resources;
+    };
+
+    const [imageResources, videoResources] = await Promise.all([
+      fetchByIds(orderedPublicIds, 'image'),
+      fetchByIds(orderedPublicIds, 'video'),
+    ]);
+
+    const resourceMap = new Map();
+    [...imageResources, ...videoResources].forEach((resource) => {
+      const publicId = normalizePath(resource?.public_id);
+      if (!publicId) {
+        return;
+      }
+      resourceMap.set(publicId, resource);
+    });
+
+    const assetsFromOrder = orderedEntries
+      .map((entry) => {
+        const resource = resourceMap.get(entry.publicId);
+        if (!resource) {
+          return null;
+        }
+        const asset = applyOverrides(toAssetPayload(resource, cloudName));
+        return asset
+          ? {
+              ...asset,
+              order: entry.sortOrder,
+            }
+          : null;
+      })
+      .filter(Boolean);
+
+    return { assets: assetsFromOrder, resources: [...imageResources, ...videoResources] };
+  };
+
+  const { assets: cloudinaryAssets, resources } = await resolveCloudinaryAssetsForFolder();
+
+  const assets = cloudinaryAssets
+    .concat(externalItems.map((item) => toExternalVideoAsset(item)))
     .sort(sortByOrderThenDate);
-  const inferredSubFolders = getImmediateChildFolders(currentFolder, [...imageResources, ...videoResources], externalItems);
+
   const folders = mergeFolderEntries(
-    [...navigatorPayload.folders.map((folder) => folder.path), ...inferredSubFolders],
+    navigatorPayload.folders.map((folder) => folder.path),
     navigatorPayload.folders.map((folder) => folder.path)
   );
 
@@ -1104,7 +1156,6 @@ const getFolderPayload = async (folderInput) => {
 };
 
 const createFolder = async (folderName, parentFolder) => {
-  const { cloudinary } = await configureCloudinary();
   const normalizedFolderName = normalizePath(folderName).split('/').pop();
 
   if (!normalizedFolderName) {
@@ -1121,13 +1172,11 @@ const createFolder = async (folderName, parentFolder) => {
 
   const parentPath = await resolveCanonicalFolderPath(parentFolder);
   const path = normalizePath(`${parentPath}/${normalizedFolderName}`);
-  await cloudinary.api.create_folder(path);
   await trackFolder(path);
   return path;
 };
 
 const renameFolder = async (folderPath, nextName) => {
-  const { cloudinary } = await configureCloudinary();
   const currentPath = await resolveCanonicalFolderPath(folderPath);
   const rootFolder = getRootFolder();
 
@@ -1157,62 +1206,6 @@ const renameFolder = async (folderPath, nextName) => {
   }
 
   try {
-    await cloudinary.api.rename_folder(currentPath, nextPath);
-  } catch (error) {
-    const rawMessage = String(error?.error?.message || error?.message || '').trim();
-    if (/cannot find source folder/i.test(rawMessage)) {
-      const [imageResources, videoResources] = await Promise.all([
-        fetchAllResources(`${currentPath}/`, 'image'),
-        fetchAllResources(`${currentPath}/`, 'video'),
-      ]);
-      const resources = [...imageResources, ...videoResources].filter((resource) => Boolean(resource?.public_id));
-
-      if (resources.length === 0) {
-        await Promise.all([
-          renameTrackedFolder(currentPath, nextPath),
-          renameExternalMediaFolder(currentPath, nextPath),
-          renameAssetOrderFolderPrefix(currentPath, nextPath).catch(() => undefined),
-          renameAssetMetadataFolderPrefix(currentPath, nextPath).catch(() => undefined),
-          trackFolder(nextPath),
-        ]);
-        return nextPath;
-      }
-
-      for (const resource of resources) {
-        const oldPublicId = normalizePath(resource.public_id);
-        if (!oldPublicId || !(oldPublicId === currentPath || oldPublicId.startsWith(`${currentPath}/`))) {
-          continue;
-        }
-
-        const nextPublicId = normalizePath(`${nextPath}${oldPublicId.slice(currentPath.length)}`);
-        if (!nextPublicId || nextPublicId === oldPublicId) {
-          continue;
-        }
-
-        await cloudinary.uploader.rename(oldPublicId, nextPublicId, {
-          resource_type: resource.resource_type === 'video' ? 'video' : 'image',
-          type: 'upload',
-          overwrite: false,
-          invalidate: true,
-        });
-      }
-
-      await Promise.all([
-        renameTrackedFolder(currentPath, nextPath),
-        renameExternalMediaFolder(currentPath, nextPath),
-        renameAssetOrderFolderPrefix(currentPath, nextPath).catch(() => undefined),
-        renameAssetMetadataFolderPrefix(currentPath, nextPath).catch(() => undefined),
-        trackFolder(nextPath),
-      ]);
-      return nextPath;
-    }
-
-    const message =
-      rawMessage || `Cloudinary rename_folder a échoué (${currentPath} -> ${nextPath}).`;
-    throw new HttpError(502, message, 'cloudinary_rename_folder_failed');
-  }
-
-  try {
     await Promise.all([
       renameTrackedFolder(currentPath, nextPath),
       renameExternalMediaFolder(currentPath, nextPath),
@@ -1223,7 +1216,7 @@ const renameFolder = async (folderPath, nextName) => {
   } catch (error) {
     const message =
       String(error?.message || error?.error?.message || '').trim() ||
-      "Le renommage des données associées (Supabase) a échoué après le renommage Cloudinary.";
+      'Le renommage du dossier a échoué.';
     throw new HttpError(500, message, 'folder_rename_postprocess_failed');
   }
 
@@ -1250,7 +1243,6 @@ const registerExistingFolder = async (folderName, parentFolder) => {
 };
 
 const deleteFolder = async (folderPath) => {
-  const { cloudinary } = await configureCloudinary();
   const normalizedPath = normalizeWithinRoot(folderPath);
   const rootFolder = getRootFolder();
 
@@ -1258,18 +1250,25 @@ const deleteFolder = async (folderPath) => {
     throw new HttpError(400, 'Le dossier racine ne peut pas etre supprime.', 'invalid_folder_delete');
   }
 
-  const [imageResources, videoResources, subFoldersResponse] = await Promise.all([
-    fetchAllResources(`${normalizedPath}/`, 'image'),
-    fetchAllResources(`${normalizedPath}/`, 'video'),
-    cloudinary.api.sub_folders(normalizedPath),
+  const supabase = getSupabaseAdmin();
+  const [trackedSubFolders, externalItems, assetOrderProbe, assetMetadataProbe] = await Promise.all([
+    listTrackedSubfolders(normalizedPath),
+    listExternalMediaByFolder(normalizedPath),
+    supabase
+      .from('admin_asset_orders')
+      .select('folder_path', { count: 'exact', head: true })
+      .or(`folder_path.eq.${normalizedPath},folder_path.like.${normalizedPath}/%`),
+    supabase
+      .from('admin_asset_metadata')
+      .select('folder_path', { count: 'exact', head: true })
+      .or(`folder_path.eq.${normalizedPath},folder_path.like.${normalizedPath}/%`),
   ]);
-  const externalItems = await listExternalMediaByFolder(normalizedPath);
 
   if (
-    imageResources.length > 0 ||
-    videoResources.length > 0 ||
     externalItems.length > 0 ||
-    (subFoldersResponse.folders || []).length > 0
+    trackedSubFolders.length > 0 ||
+    (assetOrderProbe?.count || 0) > 0 ||
+    (assetMetadataProbe?.count || 0) > 0
   ) {
     throw new HttpError(
       409,
@@ -1278,11 +1277,10 @@ const deleteFolder = async (folderPath) => {
     );
   }
 
-  await cloudinary.api.delete_folder(normalizedPath);
   await untrackFolder(normalizedPath);
 };
 
-const deleteAsset = async (publicId, resourceType = 'image', assetSource = 'cloudinary') => {
+const deleteAsset = async (folderInput, publicId, resourceType = 'image', assetSource = 'cloudinary') => {
   if (assetSource === 'external' || resourceType === 'external-video') {
     await deleteExternalMediaItem(String(publicId || '').trim());
     return;
@@ -1302,14 +1300,17 @@ const deleteAsset = async (publicId, resourceType = 'image', assetSource = 'clou
     invalidate: true,
   });
 
-  const folderPath = normalizedPublicId.slice(0, normalizedPublicId.lastIndexOf('/')) || normalizedRoot;
+  const folderPath =
+    typeof folderInput !== 'undefined' && String(folderInput || '').trim()
+      ? await resolveCanonicalFolderPath(folderInput)
+      : normalizedPublicId.slice(0, normalizedPublicId.lastIndexOf('/')) || normalizedRoot;
   await Promise.all([
     deleteAssetOrder(folderPath, normalizedPublicId).catch(() => undefined),
     deleteAssetMetadata(folderPath, normalizedPublicId).catch(() => undefined),
   ]);
 };
 
-const updateAsset = async (publicId, resourceType = 'image', updates = {}, assetSource = 'cloudinary') => {
+const updateAsset = async (folderInput, publicId, resourceType = 'image', updates = {}, assetSource = 'cloudinary') => {
   if (assetSource === 'external' || resourceType === 'external-video') {
     await updateExternalMediaItem(String(publicId || '').trim(), {
       order: updates.order,
@@ -1327,7 +1328,10 @@ const updateAsset = async (publicId, resourceType = 'image', updates = {}, asset
     throw new HttpError(400, 'Le fichier cible est invalide.', 'invalid_public_id');
   }
 
-  const folderPath = normalizedPublicId.slice(0, normalizedPublicId.lastIndexOf('/')) || normalizedRoot;
+  const folderPath =
+    typeof folderInput !== 'undefined' && String(folderInput || '').trim()
+      ? await resolveCanonicalFolderPath(folderInput)
+      : normalizedPublicId.slice(0, normalizedPublicId.lastIndexOf('/')) || normalizedRoot;
   await upsertAssetMetadata(folderPath, normalizedPublicId, {
     alt: updates.alt,
     altEn: updates.altEn,
@@ -1335,7 +1339,14 @@ const updateAsset = async (publicId, resourceType = 'image', updates = {}, asset
   });
 };
 
-const reorderAssets = async (items) => {
+const reorderAssets = async (folderInput, items) => {
+  const normalizedFolder = await resolveCanonicalFolderPath(folderInput);
+  const rootFolder = getRootFolder();
+
+  if (!normalizedFolder || normalizedFolder === rootFolder) {
+    throw new HttpError(400, 'Le dossier est obligatoire pour reordonner.', 'missing_reorder_folder');
+  }
+
   const normalizedItems = Array.isArray(items)
     ? items.map((item, index) => ({
         publicId: String(item?.publicId || '').trim(),
@@ -1349,8 +1360,8 @@ const reorderAssets = async (items) => {
     throw new HttpError(400, 'La liste a reordonner est vide.', 'missing_reorder_items');
   }
 
-  const folderGroups = new Map();
   const externalItems = [];
+  const cloudinaryItems = [];
 
   normalizedItems.forEach((item) => {
     if (item.assetSource === 'external' || item.resourceType === 'external-video') {
@@ -1359,21 +1370,17 @@ const reorderAssets = async (items) => {
     }
 
     const normalizedPublicId = normalizePath(item.publicId);
-    const normalizedRoot = getRootFolder();
+    const normalizedRoot = rootFolder;
 
     if (!normalizedPublicId || !(normalizedPublicId === normalizedRoot || normalizedPublicId.startsWith(`${normalizedRoot}/`))) {
       return;
     }
 
-    const folderPath = normalizedPublicId.slice(0, normalizedPublicId.lastIndexOf('/')) || normalizedRoot;
-    if (!folderGroups.has(folderPath)) {
-      folderGroups.set(folderPath, []);
-    }
-    folderGroups.get(folderPath).push({ publicId: normalizedPublicId, sortOrder: item.order });
+    cloudinaryItems.push({ publicId: normalizedPublicId, sortOrder: item.order });
   });
 
-  for (const [folderPath, orderedPublicIds] of folderGroups.entries()) {
-    await saveAssetOrderForFolder(folderPath, orderedPublicIds);
+  if (cloudinaryItems.length > 0) {
+    await saveAssetOrderForFolder(normalizedFolder, cloudinaryItems);
   }
 
   if (externalItems.length > 0) {
@@ -1896,7 +1903,7 @@ const resetManagedUserMfa = async (userId, currentUserId) => {
   };
 };
 
-const bulkUpdateAssets = async (items, updates) => {
+const bulkUpdateAssets = async (folderInput, items, updates) => {
   const normalizedItems = Array.isArray(items)
     ? items.map((item) => ({
         publicId: String(item?.publicId || '').trim(),
@@ -1924,6 +1931,10 @@ const bulkUpdateAssets = async (items, updates) => {
   }
 
   const normalizedRoot = getRootFolder();
+  const folderPath =
+    typeof folderInput !== 'undefined' && String(folderInput || '').trim()
+      ? await resolveCanonicalFolderPath(folderInput)
+      : null;
   const cloudinaryRows = [];
 
   await Promise.all(
@@ -1939,9 +1950,9 @@ const bulkUpdateAssets = async (items, updates) => {
         return;
       }
 
-      const folderPath = normalizedPublicId.slice(0, normalizedPublicId.lastIndexOf('/')) || normalizedRoot;
+      const effectiveFolderPath = folderPath || normalizedPublicId.slice(0, normalizedPublicId.lastIndexOf('/')) || normalizedRoot;
       cloudinaryRows.push({
-        folderPath,
+        folderPath: effectiveFolderPath,
         publicId: normalizedPublicId,
         alt: payload.alt,
         altEn: payload.altEn,
@@ -2095,7 +2106,7 @@ const handleAssets = async (req, res) => {
   if (req.method === 'DELETE') {
     const body = await readBody(req);
     const previousAsset = await getAssetAuditSnapshot(body.publicId, body.resourceType, body.assetSource);
-    await deleteAsset(body.publicId, body.resourceType, body.assetSource);
+    await deleteAsset(body.folder, body.publicId, body.resourceType, body.assetSource);
     await appendAuditLog(
       createAuditEntry(session, 'asset_deleted', 'asset', previousAsset?.targetLabel || body.publicId, {
         resourceType: previousAsset?.details?.resourceType || body.resourceType,
@@ -2118,6 +2129,7 @@ const handleAssets = async (req, res) => {
     const body = await readBody(req);
     const previousAsset = await getAssetAuditSnapshot(body.publicId, body.resourceType, body.assetSource);
     await updateAsset(
+      body.folder,
       body.publicId,
       body.resourceType,
       {
@@ -2154,6 +2166,90 @@ const handleAssets = async (req, res) => {
   throw new HttpError(405, 'Methode non autorisee.', 'method_not_allowed');
 };
 
+const handleAssetRegister = async (req, res) => {
+  await requireSession(req);
+  enforceRateLimit(req, 'admin:assets-register', { limit: 240, windowMs: 60_000 });
+
+  if (req.method !== 'POST') {
+    throw new HttpError(405, 'Methode non autorisee.', 'method_not_allowed');
+  }
+
+  const body = await readBody(req);
+  const folderPath = await resolveCanonicalFolderPath(body.folder);
+  const rootFolder = getRootFolder();
+
+  if (!folderPath || folderPath === rootFolder) {
+    throw new HttpError(400, 'Le dossier est obligatoire.', 'missing_folder');
+  }
+
+  const items = Array.isArray(body.items) ? body.items : [];
+  const normalizedItems = items
+    .map((item) => ({
+      publicId: normalizePath(item?.publicId || item?.public_id || ''),
+      resourceType: String(item?.resourceType || item?.resource_type || 'image').trim() || 'image',
+    }))
+    .filter((item) => item.publicId && item.publicId.startsWith(`${rootFolder}/`));
+
+  if (normalizedItems.length === 0) {
+    throw new HttpError(400, 'Aucun media a enregistrer.', 'missing_assets');
+  }
+
+  const existingOrderMap = await listAssetOrdersByFolder(folderPath).catch(() => new Map());
+  let maxOrder = -1;
+  if (existingOrderMap instanceof Map) {
+    existingOrderMap.forEach((order) => {
+      if (Number.isFinite(order) && order > maxOrder) {
+        maxOrder = order;
+      }
+    });
+  }
+
+  const rowsToUpsert = [];
+  let nextOrder = maxOrder + 1;
+
+  normalizedItems.forEach((item) => {
+    if (existingOrderMap instanceof Map && existingOrderMap.has(item.publicId)) {
+      return;
+    }
+    rowsToUpsert.push({
+      folder_path: folderPath,
+      public_id: item.publicId,
+      sort_order: nextOrder,
+      updated_at: new Date().toISOString(),
+    });
+    nextOrder += 1;
+  });
+
+  if (rowsToUpsert.length > 0) {
+    const supabase = getSupabaseAdmin();
+    const { error } = await supabase.from('admin_asset_orders').upsert(rowsToUpsert, {
+      onConflict: 'folder_path,public_id',
+    });
+    if (error) {
+      throw error;
+    }
+  }
+
+  const alt = typeof body.alt === 'string' ? body.alt : null;
+  const altEn = typeof body.altEn === 'string' ? body.altEn : null;
+  const tags = Array.isArray(body.tags) ? body.tags : [];
+
+  if ((alt && alt.trim()) || (altEn && altEn.trim()) || (Array.isArray(tags) && tags.length > 0)) {
+    await upsertAssetMetadataBulk(
+      normalizedItems.map((item) => ({
+        folderPath,
+        publicId: item.publicId,
+        alt,
+        altEn,
+        tags,
+      }))
+    );
+  }
+
+  void clearPortfolioPayloadCacheSafe();
+  sendJson(res, 200, { folder: folderPath, inserted: rowsToUpsert.length });
+};
+
 const handleUploadSignature = async (req, res) => {
   await requireSession(req);
   enforceRateLimit(req, 'admin:upload-signature', { limit: 240, windowMs: 60_000 });
@@ -2174,7 +2270,7 @@ const handleAssetReorder = async (req, res) => {
   }
 
   const body = await readBody(req);
-  await reorderAssets(body.items);
+  await reorderAssets(body.folder, body.items);
   await appendAuditLog(
     createAuditEntry(session, 'asset_reordered', 'gallery', 'Ordre de la galerie', {
       itemCount: Array.isArray(body.items) ? body.items.length : 0,
@@ -2192,7 +2288,7 @@ const handleAssetBulkUpdate = async (req, res) => {
   }
 
   const body = await readBody(req);
-  await bulkUpdateAssets(body.items, {
+  await bulkUpdateAssets(body.folder, body.items, {
     alt: body.alt,
     altEn: body.altEn,
     tags: body.tags,
@@ -2200,6 +2296,7 @@ const handleAssetBulkUpdate = async (req, res) => {
   await appendAuditLog(
     createAuditEntry(session, 'assets_bulk_updated', 'asset', 'Sélection multiple', {
       itemCount: Array.isArray(body.items) ? body.items.length : 0,
+      folder: body.folder || '',
       alt: body.alt,
       altEn: body.altEn,
       tags: Array.isArray(body.tags) ? body.tags : [],
@@ -2460,6 +2557,11 @@ const routeRequest = async (req, res) => {
 
   if (pathname === '/api/admin/assets') {
     await handleAssets(req, res);
+    return;
+  }
+
+  if (pathname === '/api/admin/assets/register') {
+    await handleAssetRegister(req, res);
     return;
   }
 

@@ -71,6 +71,38 @@ export const listAssetOrdersByFolder = async (folderPath) => {
   return map;
 };
 
+export const listAssetOrderEntriesByFolder = async (folderPath) => {
+  const supabase = getSupabaseClient();
+
+  if (!supabase) {
+    return [];
+  }
+
+  const normalizedFolder = normalizePath(folderPath);
+
+  if (!normalizedFolder) {
+    return [];
+  }
+
+  const { data, error } = await supabase
+    .from(SUPABASE_ASSET_ORDER_TABLE)
+    .select('public_id, sort_order')
+    .eq('folder_path', normalizedFolder)
+    .order('sort_order', { ascending: true })
+    .order('updated_at', { ascending: false });
+
+  if (error) {
+    throw error;
+  }
+
+  return (Array.isArray(data) ? data : [])
+    .map((row) => ({
+      publicId: normalizePath(row?.public_id),
+      sortOrder: Number(row?.sort_order),
+    }))
+    .filter((row) => row.publicId && Number.isFinite(row.sortOrder));
+};
+
 export const listAssetOrdersByRoot = async (rootPath) => {
   const supabase = getSupabaseClient();
 
@@ -101,6 +133,42 @@ export const listAssetOrdersByRoot = async (rootPath) => {
       return;
     }
     map.set(publicId, order);
+  });
+
+  return map;
+};
+
+export const listAssetAssignmentsByRoot = async (rootPath) => {
+  const supabase = getSupabaseClient();
+
+  if (!supabase) {
+    return new Map();
+  }
+
+  const normalizedRoot = normalizePath(rootPath);
+
+  if (!normalizedRoot) {
+    return new Map();
+  }
+
+  const { data, error } = await supabase
+    .from(SUPABASE_ASSET_ORDER_TABLE)
+    .select('folder_path, public_id, sort_order')
+    .like('folder_path', `${normalizedRoot}/%`);
+
+  if (error) {
+    throw error;
+  }
+
+  const map = new Map();
+  (Array.isArray(data) ? data : []).forEach((row) => {
+    const publicId = normalizePath(row?.public_id);
+    const folderPath = normalizePath(row?.folder_path);
+    const order = Number(row?.sort_order);
+    if (!publicId || !folderPath || !Number.isFinite(order)) {
+      return;
+    }
+    map.set(publicId, { folderPath, order });
   });
 
   return map;

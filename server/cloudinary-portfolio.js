@@ -1,7 +1,7 @@
 import { v2 as cloudinary } from 'cloudinary';
 import { listExternalMediaByRoot } from './external-media-store.js';
 import { listTrackedSubfolders } from './admin-folder-store.js';
-import { listAssetOrdersByRoot } from './admin-asset-order-store.js';
+import { listAssetAssignmentsByRoot } from './admin-asset-order-store.js';
 import { listAssetMetadataByRoot } from './admin-asset-metadata-store.js';
 
 const getFallbackRoot = () => process.env.PORTFOLIO_CLOUDINARY_ROOT || 'samples/clarisse_bonneu';
@@ -360,17 +360,21 @@ const isRateLimitError = (error) => {
   return httpCode === 420 || /rate limit/i.test(message);
 };
 
-const mapResourceToItem = (resource, root, cloudName, locale = 'fr', orderOverrides = null, metadataOverrides = null) => {
-  const relativePath = resource.public_id.startsWith(`${root}/`)
+const mapResourceToItem = (resource, root, cloudName, locale = 'fr', assignmentOverrides = null, metadataOverrides = null) => {
+  const normalizedLocale = normalizeLocale(locale);
+  const normalizedPublicId = String(resource.public_id || '').trim();
+  const assignment =
+    assignmentOverrides instanceof Map && normalizedPublicId ? assignmentOverrides.get(normalizedPublicId) : null;
+  const folderPath = String(assignment?.folderPath || '').trim();
+  const folderRelativePath = folderPath.startsWith(`${root}/`) ? folderPath.slice(root.length + 1) : folderPath;
+  const [folder] = folderRelativePath.split('/').filter(Boolean);
+  const publicIdRelativePath = resource.public_id.startsWith(`${root}/`)
     ? resource.public_id.slice(root.length + 1)
     : resource.public_id;
-  const [folder] = relativePath.split('/');
-  const category = slugify(folder || 'autres');
-  const normalizedLocale = normalizeLocale(locale);
+  const [fallbackFolder] = publicIdRelativePath.split('/');
+  const category = slugify(folder || fallbackFolder || 'autres');
   const categoryLabel = toLabel(category, normalizedLocale);
-  const normalizedPublicId = String(resource.public_id || '').trim();
-  const overrideOrder =
-    orderOverrides instanceof Map && normalizedPublicId ? orderOverrides.get(normalizedPublicId) : null;
+  const overrideOrder = Number.isFinite(Number(assignment?.order)) ? Number(assignment.order) : null;
   const altFromContext = (() => {
     const override = metadataOverrides instanceof Map && normalizedPublicId ? metadataOverrides.get(normalizedPublicId) : null;
     if (override && normalizedLocale === 'en' && String(override.altEn || '').trim()) {
@@ -548,11 +552,11 @@ export const getPortfolioPayload = async (rootInput, localeInput, versionInput) 
   });
 
   try {
-    const [imageResources, videoResources, categoryOrderMap, assetOrderMap, assetMetadataMap] = await Promise.all([
+    const [imageResources, videoResources, categoryOrderMap, assetAssignmentMap, assetMetadataMap] = await Promise.all([
       fetchAllResources(`${root}/`, 'image'),
       fetchAllResources(`${root}/`, 'video'),
       getCategoryOrderMap(root),
-      listAssetOrdersByRoot(root).catch(() => new Map()),
+      listAssetAssignmentsByRoot(root).catch(() => new Map()),
       listAssetMetadataByRoot(root).catch(() => new Map()),
     ]);
     const resources = [...imageResources, ...videoResources];
@@ -560,7 +564,7 @@ export const getPortfolioPayload = async (rootInput, localeInput, versionInput) 
     const items = sortItemsByCategoryOrder(
       resources
         .filter((resource) => resource.public_id !== root)
-        .map((resource) => mapResourceToItem(resource, root, cloudName, locale, assetOrderMap, assetMetadataMap))
+        .map((resource) => mapResourceToItem(resource, root, cloudName, locale, assetAssignmentMap, assetMetadataMap))
         .filter((item) => item.category)
         .concat(externalItems.map((item) => mapExternalVideoToItem(item, root, locale))),
       categoryOrderMap

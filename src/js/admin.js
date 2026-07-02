@@ -500,6 +500,10 @@ const state = {
   pendingAssetReorderKey: '',
   pendingAssetReorderQueued: false,
   folderReloadTimer: null,
+  pendingUploadRegisterFolder: null,
+  pendingUploadRegisterDraft: null,
+  pendingUploadRegisterItems: [],
+  pendingUploadRegisterTimer: null,
 };
 
 const ASSET_MENU_LONG_PRESS_MS = 360;
@@ -1526,6 +1530,69 @@ const scheduleFolderReload = () => {
     state.folderReloadTimer = null;
     void loadFolder(state.currentFolder);
   }, 900);
+};
+
+const queueUploadRegistration = (logicalFolder, draft, item) => {
+  const folderPath = normalizePath(logicalFolder || '');
+  const publicId = normalizePath(item?.publicId || item?.public_id || '');
+  const resourceType = String(item?.resourceType || item?.resource_type || 'image').trim() || 'image';
+
+  if (!folderPath || !publicId) {
+    return;
+  }
+
+  if (state.pendingUploadRegisterFolder && state.pendingUploadRegisterFolder !== folderPath) {
+    state.pendingUploadRegisterFolder = folderPath;
+    state.pendingUploadRegisterDraft = draft || null;
+    state.pendingUploadRegisterItems = [];
+  }
+
+  state.pendingUploadRegisterFolder = folderPath;
+  state.pendingUploadRegisterDraft = draft || null;
+  state.pendingUploadRegisterItems.push({ publicId, resourceType });
+
+  if (state.pendingUploadRegisterTimer) {
+    window.clearTimeout(state.pendingUploadRegisterTimer);
+  }
+
+  state.pendingUploadRegisterTimer = window.setTimeout(async () => {
+    state.pendingUploadRegisterTimer = null;
+
+    const folder = state.pendingUploadRegisterFolder;
+    const payloadDraft = state.pendingUploadRegisterDraft;
+    const items = Array.from(
+      new Map(
+        (Array.isArray(state.pendingUploadRegisterItems) ? state.pendingUploadRegisterItems : [])
+          .map((entry) => [normalizePath(entry?.publicId || ''), entry])
+          .filter(([key]) => key)
+      ).values()
+    );
+
+    state.pendingUploadRegisterItems = [];
+
+    if (!folder || items.length === 0) {
+      return;
+    }
+
+    try {
+      await apiRequest(getAdminApiPath('assets/register'), {
+        method: 'POST',
+        body: {
+          folder,
+          items,
+          alt: payloadDraft?.alt ?? null,
+          altEn: payloadDraft?.altEn ?? null,
+          tags: Array.isArray(payloadDraft?.tags) ? payloadDraft.tags : [],
+        },
+      });
+      bumpPortfolioCacheVersion();
+      setStatus('Import terminé. Mise à jour de la bibliothèque en cours...', 'success');
+      await loadFolder(folder);
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : "L'association des médias au dossier a échoué.", 'error');
+      scheduleFolderReload();
+    }
+  }, 520);
 };
 
 const syncDeleteFolderButtonState = (folderPath = state.currentFolder, isPending = false) => {
@@ -2917,6 +2984,7 @@ const deleteAsset = async (asset, triggerButton = null) => {
     await apiRequest(getAdminApiPath('assets'), {
       method: 'DELETE',
       body: {
+        folder: state.currentFolder,
         publicId: asset.publicId,
         resourceType: asset.resourceType,
         assetSource: asset.assetSource,
@@ -4364,12 +4432,14 @@ const registerExistingFolder = async (folderName, parentFolder) => {
   return normalizePath(payload?.path || '');
 };
 
-const createUploadWidget = (folder, tags, contextString, mediaKind) => {
+const createUploadWidget = (uploadFolder, logicalFolder, tags, contextString, mediaKind) => {
   if (!window.cloudinary?.createUploadWidget) {
     throw new Error('Le widget Cloudinary est indisponible dans ce navigateur.');
   }
 
   const isVideo = mediaKind === 'video';
+  const normalizedUploadFolder = normalizePath(uploadFolder);
+  const normalizedLogicalFolder = normalizePath(logicalFolder);
 
   return window.cloudinary.createUploadWidget(
     {
@@ -4406,7 +4476,7 @@ const createUploadWidget = (folder, tags, contextString, mediaKind) => {
             body: {
               paramsToSign: {
                 ...paramsToSign,
-                folder,
+                folder: normalizedUploadFolder,
                 tags: tags.join(','),
                 context: contextString,
                 upload_preset: config.cloudinaryUploadPreset,
@@ -4416,7 +4486,7 @@ const createUploadWidget = (folder, tags, contextString, mediaKind) => {
 
           callback({
             apiKey: config.cloudinaryApiKey || data.apiKey,
-            folder,
+            folder: normalizedUploadFolder,
             tags: tags.join(','),
             context: contextString,
             uploadPreset: config.cloudinaryUploadPreset,
@@ -4436,8 +4506,12 @@ const createUploadWidget = (folder, tags, contextString, mediaKind) => {
       }
 
       if (result?.event === 'success') {
-        setStatus('Import terminé. Mise à jour de la bibliothèque en cours...', 'success');
-        scheduleFolderReload();
+        const info = result?.info || {};
+        queueUploadRegistration(
+          normalizedLogicalFolder,
+          state.pendingUploadRegisterDraft,
+          { publicId: info.public_id, resourceType: info.resource_type }
+        );
       }
     }
   );
@@ -4584,6 +4658,7 @@ const savePreviewChanges = async () => {
     await apiRequest(getAdminApiPath('assets'), {
       method: 'PATCH',
       body: {
+        folder: state.currentFolder,
         publicId: asset.publicId,
         resourceType: asset.resourceType,
         assetSource: asset.assetSource,
@@ -5289,6 +5364,7 @@ const bindEvents = () => {
           },
         });
 
+        bumpPortfolioCacheVersion();
         setStatus(`Le dossier "${getFolderDisplayName(state.currentFolder)}" a été renommé.`, 'success');
         closeFolderDialog();
         state.showUploadStage = false;
@@ -5304,6 +5380,7 @@ const bindEvents = () => {
         });
 
         const createdFolderPath = payload?.path || normalizePath(`${config.rootFolder}/${folderName}`);
+        bumpPortfolioCacheVersion();
         closeFolderDialog();
         state.showUploadStage = false;
         state.selectedFolder = createdFolderPath;
@@ -5468,6 +5545,7 @@ const bindEvents = () => {
           path: state.currentFolder,
         },
       });
+      bumpPortfolioCacheVersion();
       setStatus('Le dossier a été supprimé avec succès.', 'success');
       state.showUploadStage = false;
       await syncExplorerFolders();
@@ -5535,7 +5613,14 @@ const bindEvents = () => {
       }
 
       setBusy(dom.mediaSubmitButton, true, 'Ouverture...');
-      const widget = createUploadWidget(folder, tags, contextString, mediaKind);
+      const uploadFolder = normalizePath(`${config.rootFolder}/_assets`);
+      state.pendingUploadRegisterFolder = folder;
+      state.pendingUploadRegisterDraft = {
+        alt: altFr,
+        altEn,
+        tags,
+      };
+      const widget = createUploadWidget(uploadFolder, folder, tags, contextString, mediaKind);
       widget.open();
       setStatus("L'outil d'import est ouvert pour les fichiers sélectionnés.", 'info');
     } catch (error) {
@@ -5979,6 +6064,7 @@ const bindEvents = () => {
       await apiRequest(getAdminApiPath('assets/bulk'), {
         method: 'POST',
         body: {
+          folder: state.currentFolder,
           items: selectedItems.map((asset) => ({
             publicId: asset.publicId,
             resourceType: asset.resourceType,
