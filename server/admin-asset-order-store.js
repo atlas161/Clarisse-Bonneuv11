@@ -290,16 +290,20 @@ export const renameAssetOrderFolderPrefix = async (fromFolder, toFolder) => {
     return;
   }
 
-  const { data, error } = await supabase
-    .from(SUPABASE_ASSET_ORDER_TABLE)
-    .select('folder_path, public_id, sort_order')
-    .or(`folder_path.eq.${normalizedFrom},folder_path.like.${normalizedFrom}/%`);
+  const [baseResponse, nestedResponse] = await Promise.all([
+    supabase.from(SUPABASE_ASSET_ORDER_TABLE).select('folder_path, public_id, sort_order').eq('folder_path', normalizedFrom),
+    supabase.from(SUPABASE_ASSET_ORDER_TABLE).select('folder_path, public_id, sort_order').like('folder_path', `${normalizedFrom}/%`),
+  ]);
 
-  if (error) {
-    throw error;
+  if (baseResponse.error) {
+    throw baseResponse.error;
   }
 
-  const rows = Array.isArray(data) ? data : [];
+  if (nestedResponse.error) {
+    throw nestedResponse.error;
+  }
+
+  const rows = [...(Array.isArray(baseResponse.data) ? baseResponse.data : []), ...(Array.isArray(nestedResponse.data) ? nestedResponse.data : [])];
 
   if (rows.length === 0) {
     return;
@@ -345,23 +349,17 @@ export const renameAssetOrderFolderPrefix = async (fromFolder, toFolder) => {
     }
   }
 
-  const keysToDelete = rows
-    .map((row) => ({
-      folderPath: normalizePath(row?.folder_path),
-      publicId: normalizePath(row?.public_id),
-    }))
-    .filter((entry) => entry.folderPath && entry.publicId);
+  const [{ error: deleteBaseError }, { error: deleteNestedError }] = await Promise.all([
+    supabase.from(SUPABASE_ASSET_ORDER_TABLE).delete().eq('folder_path', normalizedFrom),
+    supabase.from(SUPABASE_ASSET_ORDER_TABLE).delete().like('folder_path', `${normalizedFrom}/%`),
+  ]);
 
-  for (const key of keysToDelete) {
-    const { error: deleteError } = await supabase
-      .from(SUPABASE_ASSET_ORDER_TABLE)
-      .delete()
-      .eq('folder_path', key.folderPath)
-      .eq('public_id', key.publicId);
+  if (deleteBaseError) {
+    throw deleteBaseError;
+  }
 
-    if (deleteError) {
-      throw deleteError;
-    }
+  if (deleteNestedError) {
+    throw deleteNestedError;
   }
 };
 

@@ -130,19 +130,19 @@ const readStore = async () => {
       throw error;
     }
 
+    const storedPaths = uniqueFolderPaths(sortFolderRows(data).map((row) => normalizePath(row?.path)));
+
     return {
-      folders: uniqueFolderPaths([
-        ...sortFolderRows(data).map((row) => normalizePath(row?.path)),
-        ...getDefaultFolders(),
-      ]),
+      folders: storedPaths.length > 0 ? storedPaths : getDefaultFolders(),
     };
   }
 
   try {
     const raw = await fs.readFile(STORE_PATH, 'utf8');
     const parsed = JSON.parse(raw);
+    const storedPaths = uniqueFolderPaths(Array.isArray(parsed.folders) ? parsed.folders : []);
     return {
-      folders: uniqueFolderPaths([...(Array.isArray(parsed.folders) ? parsed.folders : []), ...getDefaultFolders()]),
+      folders: storedPaths.length > 0 ? storedPaths : getDefaultFolders(),
     };
   } catch (error) {
     if (error && error.code === 'ENOENT') {

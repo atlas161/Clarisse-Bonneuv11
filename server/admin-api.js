@@ -1206,13 +1206,12 @@ const renameFolder = async (folderPath, nextName) => {
   }
 
   try {
-    await Promise.all([
-      renameTrackedFolder(currentPath, nextPath),
-      renameExternalMediaFolder(currentPath, nextPath),
-      renameAssetOrderFolderPrefix(currentPath, nextPath).catch(() => undefined),
-      renameAssetMetadataFolderPrefix(currentPath, nextPath).catch(() => undefined),
-      trackFolder(nextPath),
-    ]);
+    await renameAssetOrderFolderPrefix(currentPath, nextPath);
+    await renameAssetMetadataFolderPrefix(currentPath, nextPath);
+    await renameExternalMediaFolder(currentPath, nextPath);
+    await renameTrackedFolder(currentPath, nextPath);
+    await untrackFolder(currentPath);
+    await trackFolder(nextPath);
   } catch (error) {
     const message =
       String(error?.message || error?.error?.message || '').trim() ||
