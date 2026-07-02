@@ -1149,12 +1149,27 @@ const renameFolder = async (folderPath, nextName) => {
     return currentPath;
   }
 
-  await cloudinary.api.rename_folder(currentPath, nextPath);
-  await Promise.all([
-    renameTrackedFolder(currentPath, nextPath),
-    renameExternalMediaFolder(currentPath, nextPath),
-    trackFolder(nextPath),
-  ]);
+  try {
+    await cloudinary.api.rename_folder(currentPath, nextPath);
+  } catch (error) {
+    const message =
+      String(error?.error?.message || error?.message || '').trim() ||
+      `Cloudinary rename_folder a échoué (${currentPath} -> ${nextPath}).`;
+    throw new HttpError(502, message, 'cloudinary_rename_folder_failed');
+  }
+
+  try {
+    await Promise.all([
+      renameTrackedFolder(currentPath, nextPath),
+      renameExternalMediaFolder(currentPath, nextPath),
+      trackFolder(nextPath),
+    ]);
+  } catch (error) {
+    const message =
+      String(error?.message || error?.error?.message || '').trim() ||
+      "Le renommage des données associées (Supabase) a échoué après le renommage Cloudinary.";
+    throw new HttpError(500, message, 'folder_rename_postprocess_failed');
+  }
 
   return nextPath;
 };
@@ -2472,9 +2487,14 @@ export const handleAdminApi = async (req, res) => {
     }
 
     console.error('[admin-api]', error);
+    const message =
+      (error instanceof Error ? error.message : '') ||
+      String(error?.error?.message || error?.message || '').trim() ||
+      (typeof error === 'string' ? error : '') ||
+      'Une erreur inattendue est survenue.';
     sendJson(res, 500, {
       error: 'admin_api_error',
-      message: error instanceof Error ? error.message : 'Une erreur inattendue est survenue.',
+      message,
     });
   }
 };

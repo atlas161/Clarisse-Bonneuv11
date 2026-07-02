@@ -107,13 +107,18 @@ export const handler = async (event) => {
   } catch (error) {
     console.error('[netlify-admin-api]', error);
     if (!response.ended) {
+      const message =
+        (error instanceof Error ? error.message : '') ||
+        String(error?.error?.message || error?.message || '').trim() ||
+        (typeof error === 'string' ? error : '') ||
+        'Une erreur inattendue est survenue.';
       response.statusCode = 500;
       response.setHeader('Content-Type', 'application/json; charset=utf-8');
       response.setHeader('Cache-Control', 'no-store');
       response.end(
         JSON.stringify({
           error: 'netlify_handler_error',
-          message: error instanceof Error ? error.message : 'Une erreur inattendue est survenue.',
+          message,
         })
       );
     }
