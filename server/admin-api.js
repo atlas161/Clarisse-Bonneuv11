@@ -1206,162 +1206,43 @@ const renameFolder = async (folderPath, nextName) => {
   }
 
   try {
-    const supabase = getSupabaseAdmin();
-    const [baseOrdersResponse, nestedOrdersResponse] = await Promise.all([
-      supabase
-        .from('admin_asset_orders')
-        .select('public_id, sort_order, updated_at')
-        .eq('folder_path', currentPath),
-      supabase
-        .from('admin_asset_orders')
-        .select('public_id, sort_order, updated_at')
-        .like('folder_path', `${currentPath}/%`),
+    const [directOrderEntries, directCloudinaryPublicIds] = await Promise.all([
+      listAssetOrderEntriesByFolder(currentPath).catch(() => []),
+      (async () => {
+        const [imageResources, videoResources] = await Promise.all([
+          fetchAllResources(`${currentPath}/`, 'image'),
+          fetchAllResources(`${currentPath}/`, 'video'),
+        ]);
+
+        return [...imageResources, ...videoResources]
+          .filter((resource) => Boolean(resource?.public_id))
+          .sort(sortByOrderThenDate)
+          .map((resource) => normalizePath(resource.public_id))
+          .filter((publicId) => {
+            if (!publicId) {
+              return false;
+            }
+
+            const parentPath = publicId.slice(0, publicId.lastIndexOf('/')) || rootFolder;
+            return parentPath === currentPath;
+          })
+          .filter(Boolean);
+      })(),
     ]);
 
-    if (baseOrdersResponse.error) {
-      throw baseOrdersResponse.error;
-    }
-
-    if (nestedOrdersResponse.error) {
-      throw nestedOrdersResponse.error;
-    }
-
-    const existingOrderRows = [
-      ...(Array.isArray(baseOrdersResponse.data) ? baseOrdersResponse.data : []),
-      ...(Array.isArray(nestedOrdersResponse.data) ? nestedOrdersResponse.data : []),
-    ];
-
-    const publicIdsFromOrders = existingOrderRows
-      .map((row) => ({
-        publicId: normalizePath(row?.public_id),
-        sortOrder: Number(row?.sort_order),
-        updatedAt: new Date(row?.updated_at || 0).getTime(),
-      }))
-      .filter((row) => row.publicId && Number.isFinite(row.sortOrder))
-      .sort((left, right) => {
-        if (left.sortOrder !== right.sortOrder) {
-          return left.sortOrder - right.sortOrder;
-        }
-        return right.updatedAt - left.updatedAt;
-      })
-      .map((row) => row.publicId);
-
-    const publicIdsFromCloudinary = await (async () => {
-      const [imageResources, videoResources] = await Promise.all([
-        fetchAllResources(`${currentPath}/`, 'image'),
-        fetchAllResources(`${currentPath}/`, 'video'),
-      ]);
-
-      const resources = [...imageResources, ...videoResources].filter((resource) => Boolean(resource?.public_id));
-
-      return resources
-        .sort(sortByOrderThenDate)
-        .map((resource) => normalizePath(resource.public_id))
-        .filter(Boolean);
-    })();
-
     const orderedPublicIds = Array.from(
-      new Set([...(publicIdsFromOrders.length > 0 ? publicIdsFromOrders : publicIdsFromCloudinary)])
+      new Set([
+        ...directOrderEntries.map((entry) => normalizePath(entry?.publicId)).filter(Boolean),
+        ...directCloudinaryPublicIds,
+      ])
     );
 
     if (orderedPublicIds.length > 0) {
-      await saveAssetOrderForFolder(nextPath, orderedPublicIds);
+      await saveAssetOrderForFolder(currentPath, orderedPublicIds);
     }
 
-    const [baseMetadataResponse, nestedMetadataResponse] = await Promise.all([
-      supabase
-        .from('admin_asset_metadata')
-        .select('public_id, alt, alt_en, tags, updated_at')
-        .eq('folder_path', currentPath),
-      supabase
-        .from('admin_asset_metadata')
-        .select('public_id, alt, alt_en, tags, updated_at')
-        .like('folder_path', `${currentPath}/%`),
-    ]);
-
-    if (baseMetadataResponse.error) {
-      throw baseMetadataResponse.error;
-    }
-
-    if (nestedMetadataResponse.error) {
-      throw nestedMetadataResponse.error;
-    }
-
-    const metadataRows = [
-      ...(Array.isArray(baseMetadataResponse.data) ? baseMetadataResponse.data : []),
-      ...(Array.isArray(nestedMetadataResponse.data) ? nestedMetadataResponse.data : []),
-    ];
-
-    if (metadataRows.length > 0) {
-      const metadataByPublicId = new Map();
-
-      metadataRows.forEach((row) => {
-        const publicId = normalizePath(row?.public_id);
-        if (!publicId) {
-          return;
-        }
-        const updatedAt = new Date(row?.updated_at || 0).getTime();
-        const current = metadataByPublicId.get(publicId);
-        if (!current || updatedAt >= current.updatedAt) {
-          metadataByPublicId.set(publicId, {
-            publicId,
-            alt: row?.alt ?? null,
-            altEn: row?.alt_en ?? null,
-            tags: Array.isArray(row?.tags) ? row.tags : [],
-            updatedAt,
-          });
-        }
-      });
-
-      const rowsToUpsert = Array.from(metadataByPublicId.values()).map((entry) => ({
-        folder_path: nextPath,
-        public_id: entry.publicId,
-        alt: entry.alt,
-        alt_en: entry.altEn,
-        tags: Array.isArray(entry.tags) ? entry.tags : [],
-        updated_at: new Date().toISOString(),
-      }));
-
-      const chunkSize = 800;
-      for (let offset = 0; offset < rowsToUpsert.length; offset += chunkSize) {
-        const slice = rowsToUpsert.slice(offset, offset + chunkSize);
-        if (slice.length === 0) {
-          continue;
-        }
-        const { error: upsertError } = await supabase.from('admin_asset_metadata').upsert(slice, {
-          onConflict: 'folder_path,public_id',
-        });
-        if (upsertError) {
-          throw upsertError;
-        }
-      }
-    }
-
-    const [{ error: deleteOrdersBaseError }, { error: deleteOrdersNestedError }] = await Promise.all([
-      supabase.from('admin_asset_orders').delete().eq('folder_path', currentPath),
-      supabase.from('admin_asset_orders').delete().like('folder_path', `${currentPath}/%`),
-    ]);
-
-    if (deleteOrdersBaseError) {
-      throw deleteOrdersBaseError;
-    }
-
-    if (deleteOrdersNestedError) {
-      throw deleteOrdersNestedError;
-    }
-
-    const [{ error: deleteMetadataBaseError }, { error: deleteMetadataNestedError }] = await Promise.all([
-      supabase.from('admin_asset_metadata').delete().eq('folder_path', currentPath),
-      supabase.from('admin_asset_metadata').delete().like('folder_path', `${currentPath}/%`),
-    ]);
-
-    if (deleteMetadataBaseError) {
-      throw deleteMetadataBaseError;
-    }
-
-    if (deleteMetadataNestedError) {
-      throw deleteMetadataNestedError;
-    }
+    await renameAssetOrderFolderPrefix(currentPath, nextPath);
+    await renameAssetMetadataFolderPrefix(currentPath, nextPath);
 
     await renameExternalMediaFolder(currentPath, nextPath);
     await renameTrackedFolder(currentPath, nextPath);

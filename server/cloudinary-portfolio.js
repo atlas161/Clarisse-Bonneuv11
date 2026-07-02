@@ -158,6 +158,49 @@ const sortItemsByCategoryOrder = (items, categoryOrderMap) =>
     });
   });
 
+const getTopLevelSegmentFromPath = (pathValue, root) => {
+  const normalizedPath = String(pathValue || '').trim();
+
+  if (!normalizedPath) {
+    return '';
+  }
+
+  const relativePath = normalizedPath.startsWith(`${root}/`) ? normalizedPath.slice(root.length + 1) : normalizedPath;
+  return relativePath.split('/').filter(Boolean)[0] || '';
+};
+
+const buildLegacyCategoryAliasMap = (resources, root, assignmentOverrides) => {
+  if (!(assignmentOverrides instanceof Map) || assignmentOverrides.size === 0) {
+    return new Map();
+  }
+
+  const aliasCandidates = new Map();
+
+  (Array.isArray(resources) ? resources : []).forEach((resource) => {
+    const normalizedPublicId = String(resource?.public_id || '').trim();
+    const assignment = normalizedPublicId ? assignmentOverrides.get(normalizedPublicId) : null;
+    const physicalCategory = slugify(getTopLevelSegmentFromPath(normalizedPublicId, root));
+    const logicalCategory = slugify(getTopLevelSegmentFromPath(assignment?.folderPath, root));
+
+    if (!physicalCategory || !logicalCategory || physicalCategory === logicalCategory) {
+      return;
+    }
+
+    const existing = aliasCandidates.get(physicalCategory) || new Set();
+    existing.add(logicalCategory);
+    aliasCandidates.set(physicalCategory, existing);
+  });
+
+  const aliases = new Map();
+  aliasCandidates.forEach((logicalCategories, physicalCategory) => {
+    if (logicalCategories.size === 1) {
+      aliases.set(physicalCategory, Array.from(logicalCategories)[0]);
+    }
+  });
+
+  return aliases;
+};
+
 const labelOverrides = {
   fr: {
     editorial: 'Éditorial',
@@ -360,7 +403,15 @@ const isRateLimitError = (error) => {
   return httpCode === 420 || /rate limit/i.test(message);
 };
 
-const mapResourceToItem = (resource, root, cloudName, locale = 'fr', assignmentOverrides = null, metadataOverrides = null) => {
+const mapResourceToItem = (
+  resource,
+  root,
+  cloudName,
+  locale = 'fr',
+  assignmentOverrides = null,
+  metadataOverrides = null,
+  legacyCategoryAliases = null
+) => {
   const normalizedLocale = normalizeLocale(locale);
   const normalizedPublicId = String(resource.public_id || '').trim();
   const assignment =
@@ -372,7 +423,13 @@ const mapResourceToItem = (resource, root, cloudName, locale = 'fr', assignmentO
     ? resource.public_id.slice(root.length + 1)
     : resource.public_id;
   const [fallbackFolder] = publicIdRelativePath.split('/');
-  const category = slugify(folder || fallbackFolder || 'autres');
+  const directCategory = slugify(folder || '');
+  const fallbackCategory = slugify(fallbackFolder || '');
+  const resolvedFallbackCategory =
+    legacyCategoryAliases instanceof Map && fallbackCategory
+      ? legacyCategoryAliases.get(fallbackCategory) || fallbackCategory
+      : fallbackCategory;
+  const category = directCategory || resolvedFallbackCategory || 'autres';
   const categoryLabel = toLabel(category, normalizedLocale);
   const overrideOrder = Number.isFinite(Number(assignment?.order)) ? Number(assignment.order) : null;
   const altFromContext = (() => {
@@ -561,10 +618,21 @@ export const getPortfolioPayload = async (rootInput, localeInput, versionInput) 
     ]);
     const resources = [...imageResources, ...videoResources];
     const externalItems = await listExternalMediaByRoot(root);
+    const legacyCategoryAliases = buildLegacyCategoryAliasMap(resources, root, assetAssignmentMap);
     const items = sortItemsByCategoryOrder(
       resources
         .filter((resource) => resource.public_id !== root)
-        .map((resource) => mapResourceToItem(resource, root, cloudName, locale, assetAssignmentMap, assetMetadataMap))
+        .map((resource) =>
+          mapResourceToItem(
+            resource,
+            root,
+            cloudName,
+            locale,
+            assetAssignmentMap,
+            assetMetadataMap,
+            legacyCategoryAliases
+          )
+        )
         .filter((item) => item.category)
         .concat(externalItems.map((item) => mapExternalVideoToItem(item, root, locale))),
       categoryOrderMap
