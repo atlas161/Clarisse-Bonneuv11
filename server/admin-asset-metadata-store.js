@@ -259,3 +259,93 @@ export const deleteAssetMetadata = async (folderPath, publicId) => {
     throw error;
   }
 };
+
+export const renameAssetMetadataFolderPrefix = async (fromFolder, toFolder) => {
+  const supabase = getSupabaseClient();
+
+  if (!supabase) {
+    return;
+  }
+
+  const normalizedFrom = normalizePath(fromFolder);
+  const normalizedTo = normalizePath(toFolder);
+
+  if (!normalizedFrom || !normalizedTo || normalizedFrom === normalizedTo) {
+    return;
+  }
+
+  const { data, error } = await supabase
+    .from(SUPABASE_ASSET_METADATA_TABLE)
+    .select('folder_path, public_id, alt, alt_en, tags')
+    .or(`folder_path.eq.${normalizedFrom},folder_path.like.${normalizedFrom}/%`);
+
+  if (error) {
+    throw error;
+  }
+
+  const rows = Array.isArray(data) ? data : [];
+
+  if (rows.length === 0) {
+    return;
+  }
+
+  const nextRows = rows
+    .map((row) => {
+      const folderPath = normalizePath(row?.folder_path);
+      const publicId = normalizePath(row?.public_id);
+
+      if (!folderPath || !publicId) {
+        return null;
+      }
+
+      const nextFolderPath =
+        folderPath === normalizedFrom
+          ? normalizedTo
+          : folderPath.startsWith(`${normalizedFrom}/`)
+            ? `${normalizedTo}${folderPath.slice(normalizedFrom.length)}`
+            : folderPath;
+
+      if (!nextFolderPath) {
+        return null;
+      }
+
+      return {
+        folder_path: nextFolderPath,
+        public_id: publicId,
+        alt: row?.alt ?? null,
+        alt_en: row?.alt_en ?? null,
+        tags: normalizeTags(row?.tags),
+        updated_at: new Date().toISOString(),
+      };
+    })
+    .filter(Boolean);
+
+  if (nextRows.length > 0) {
+    const { error: upsertError } = await supabase.from(SUPABASE_ASSET_METADATA_TABLE).upsert(nextRows, {
+      onConflict: 'folder_path,public_id',
+    });
+
+    if (upsertError) {
+      throw upsertError;
+    }
+  }
+
+  const keysToDelete = rows
+    .map((row) => ({
+      folderPath: normalizePath(row?.folder_path),
+      publicId: normalizePath(row?.public_id),
+    }))
+    .filter((entry) => entry.folderPath && entry.publicId);
+
+  for (const key of keysToDelete) {
+    const { error: deleteError } = await supabase
+      .from(SUPABASE_ASSET_METADATA_TABLE)
+      .delete()
+      .eq('folder_path', key.folderPath)
+      .eq('public_id', key.publicId);
+
+    if (deleteError) {
+      throw deleteError;
+    }
+  }
+};

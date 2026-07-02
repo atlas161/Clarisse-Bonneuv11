@@ -10,11 +10,18 @@ import {
   toExternalVideoAsset,
   updateExternalMediaItem,
 } from './external-media-store.js';
-import { deleteAssetOrder, getAssetOrder, listAssetOrdersByFolder, saveAssetOrderForFolder } from './admin-asset-order-store.js';
+import {
+  deleteAssetOrder,
+  getAssetOrder,
+  listAssetOrdersByFolder,
+  renameAssetOrderFolderPrefix,
+  saveAssetOrderForFolder,
+} from './admin-asset-order-store.js';
 import {
   deleteAssetMetadata,
   getAssetMetadata,
   listAssetMetadataByFolder,
+  renameAssetMetadataFolderPrefix,
   upsertAssetMetadata,
   upsertAssetMetadataBulk,
 } from './admin-asset-metadata-store.js';
@@ -1152,9 +1159,56 @@ const renameFolder = async (folderPath, nextName) => {
   try {
     await cloudinary.api.rename_folder(currentPath, nextPath);
   } catch (error) {
+    const rawMessage = String(error?.error?.message || error?.message || '').trim();
+    if (/cannot find source folder/i.test(rawMessage)) {
+      const [imageResources, videoResources] = await Promise.all([
+        fetchAllResources(`${currentPath}/`, 'image'),
+        fetchAllResources(`${currentPath}/`, 'video'),
+      ]);
+      const resources = [...imageResources, ...videoResources].filter((resource) => Boolean(resource?.public_id));
+
+      if (resources.length === 0) {
+        await Promise.all([
+          renameTrackedFolder(currentPath, nextPath),
+          renameExternalMediaFolder(currentPath, nextPath),
+          renameAssetOrderFolderPrefix(currentPath, nextPath).catch(() => undefined),
+          renameAssetMetadataFolderPrefix(currentPath, nextPath).catch(() => undefined),
+          trackFolder(nextPath),
+        ]);
+        return nextPath;
+      }
+
+      for (const resource of resources) {
+        const oldPublicId = normalizePath(resource.public_id);
+        if (!oldPublicId || !(oldPublicId === currentPath || oldPublicId.startsWith(`${currentPath}/`))) {
+          continue;
+        }
+
+        const nextPublicId = normalizePath(`${nextPath}${oldPublicId.slice(currentPath.length)}`);
+        if (!nextPublicId || nextPublicId === oldPublicId) {
+          continue;
+        }
+
+        await cloudinary.uploader.rename(oldPublicId, nextPublicId, {
+          resource_type: resource.resource_type === 'video' ? 'video' : 'image',
+          type: 'upload',
+          overwrite: false,
+          invalidate: true,
+        });
+      }
+
+      await Promise.all([
+        renameTrackedFolder(currentPath, nextPath),
+        renameExternalMediaFolder(currentPath, nextPath),
+        renameAssetOrderFolderPrefix(currentPath, nextPath).catch(() => undefined),
+        renameAssetMetadataFolderPrefix(currentPath, nextPath).catch(() => undefined),
+        trackFolder(nextPath),
+      ]);
+      return nextPath;
+    }
+
     const message =
-      String(error?.error?.message || error?.message || '').trim() ||
-      `Cloudinary rename_folder a échoué (${currentPath} -> ${nextPath}).`;
+      rawMessage || `Cloudinary rename_folder a échoué (${currentPath} -> ${nextPath}).`;
     throw new HttpError(502, message, 'cloudinary_rename_folder_failed');
   }
 
@@ -1162,6 +1216,8 @@ const renameFolder = async (folderPath, nextName) => {
     await Promise.all([
       renameTrackedFolder(currentPath, nextPath),
       renameExternalMediaFolder(currentPath, nextPath),
+      renameAssetOrderFolderPrefix(currentPath, nextPath).catch(() => undefined),
+      renameAssetMetadataFolderPrefix(currentPath, nextPath).catch(() => undefined),
       trackFolder(nextPath),
     ]);
   } catch (error) {
