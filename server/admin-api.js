@@ -1206,6 +1206,81 @@ const renameFolder = async (folderPath, nextName) => {
   }
 
   try {
+    const supabase = getSupabaseAdmin();
+    const [baseOrderProbe, nestedOrderProbe] = await Promise.all([
+      supabase.from('admin_asset_orders').select('folder_path', { count: 'exact', head: true }).eq('folder_path', currentPath),
+      supabase.from('admin_asset_orders').select('folder_path', { count: 'exact', head: true }).like('folder_path', `${currentPath}/%`),
+    ]);
+
+    if (baseOrderProbe.error) {
+      throw baseOrderProbe.error;
+    }
+
+    if (nestedOrderProbe.error) {
+      throw nestedOrderProbe.error;
+    }
+
+    const existingOrderCount = (baseOrderProbe.count || 0) + (nestedOrderProbe.count || 0);
+
+    if (existingOrderCount === 0) {
+      const [imageResources, videoResources] = await Promise.all([
+        fetchAllResources(`${currentPath}/`, 'image'),
+        fetchAllResources(`${currentPath}/`, 'video'),
+      ]);
+
+      const resources = [...imageResources, ...videoResources].filter((resource) => Boolean(resource?.public_id));
+      const groups = new Map();
+
+      resources.forEach((resource) => {
+        const publicId = normalizePath(resource.public_id);
+        if (!publicId) {
+          return;
+        }
+        const folderOld = publicId.slice(0, publicId.lastIndexOf('/')) || rootFolder;
+        if (!(folderOld === currentPath || folderOld.startsWith(`${currentPath}/`))) {
+          return;
+        }
+        const folderNew =
+          folderOld === currentPath ? nextPath : `${nextPath}${folderOld.slice(currentPath.length)}`;
+        if (!groups.has(folderNew)) {
+          groups.set(folderNew, []);
+        }
+        groups.get(folderNew).push({ publicId, resource });
+      });
+
+      const rows = [];
+      for (const [folderNew, entries] of groups.entries()) {
+        const ordered = entries
+          .map((entry) => entry.resource)
+          .sort(sortByOrderThenDate)
+          .map((resource) => normalizePath(resource.public_id))
+          .filter(Boolean);
+
+        ordered.forEach((publicId, index) => {
+          rows.push({
+            folder_path: folderNew,
+            public_id: publicId,
+            sort_order: index,
+            updated_at: new Date().toISOString(),
+          });
+        });
+      }
+
+      const chunkSize = 800;
+      for (let offset = 0; offset < rows.length; offset += chunkSize) {
+        const slice = rows.slice(offset, offset + chunkSize);
+        if (slice.length === 0) {
+          continue;
+        }
+        const { error: upsertError } = await supabase.from('admin_asset_orders').upsert(slice, {
+          onConflict: 'folder_path,public_id',
+        });
+        if (upsertError) {
+          throw upsertError;
+        }
+      }
+    }
+
     await renameAssetOrderFolderPrefix(currentPath, nextPath);
     await renameAssetMetadataFolderPrefix(currentPath, nextPath);
     await renameExternalMediaFolder(currentPath, nextPath);
