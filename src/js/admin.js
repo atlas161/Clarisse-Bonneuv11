@@ -4409,7 +4409,6 @@ const createUploadWidget = (folder, tags, contextString, mediaKind) => {
                 folder,
                 tags: tags.join(','),
                 context: contextString,
-                resource_type: isVideo ? 'video' : 'image',
                 upload_preset: config.cloudinaryUploadPreset,
               },
             },

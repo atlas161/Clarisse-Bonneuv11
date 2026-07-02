@@ -1374,14 +1374,43 @@ const signUpload = async (body) => {
     throw new HttpError(400, 'Le contexte Cloudinary est trop long.', 'upload_context_too_long');
   }
 
-  const signedParams = {
-    timestamp,
-    folder: normalizeWithinRoot(paramsToSign.folder),
-    tags,
-    context,
-    resource_type: resourceType,
-    upload_preset: uploadPreset,
-  };
+  const signedParams = {};
+
+  Object.entries(paramsToSign).forEach(([key, value]) => {
+    const normalizedKey = String(key || '').trim();
+    if (!normalizedKey) {
+      return;
+    }
+    if (normalizedKey === 'file' || normalizedKey === 'signature' || normalizedKey === 'api_key') {
+      return;
+    }
+    if (value === undefined || value === null) {
+      return;
+    }
+    if (typeof value === 'object') {
+      return;
+    }
+    const normalizedValue = String(value).trim();
+    if (!normalizedValue) {
+      return;
+    }
+    signedParams[normalizedKey] = normalizedValue;
+  });
+
+  signedParams.timestamp = timestamp;
+  signedParams.folder = normalizeWithinRoot(paramsToSign.folder);
+  signedParams.tags = tags;
+  signedParams.context = context;
+  signedParams.upload_preset = uploadPreset;
+
+  if (Object.prototype.hasOwnProperty.call(signedParams, 'resource_type')) {
+    const normalized = String(signedParams.resource_type || '').trim().toLowerCase();
+    if (normalized !== 'video') {
+      delete signedParams.resource_type;
+    } else {
+      signedParams.resource_type = 'video';
+    }
+  }
 
   const source = String(paramsToSign.source ?? '').trim();
   if (source) {
