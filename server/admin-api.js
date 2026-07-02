@@ -1383,6 +1383,11 @@ const signUpload = async (body) => {
     upload_preset: uploadPreset,
   };
 
+  const source = String(paramsToSign.source ?? '').trim();
+  if (source) {
+    signedParams.source = source;
+  }
+
   const signature = cloudinary.utils.api_sign_request(signedParams, apiSecret);
 
   return {
