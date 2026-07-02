@@ -2940,6 +2940,7 @@ const commitInlineFolderRename = async () => {
     dom.libraryTitle.contentEditable = 'false';
     dom.libraryTitle.classList.remove('is-editing');
     syncInlineFolderRenameUI();
+    bumpPortfolioCacheVersion();
     await syncExplorerFolders();
     await loadFolder(payload?.path || config.rootFolder);
     setStatus(`Le dossier "${currentName}" a été renommé en "${nextName}".`, 'success');
